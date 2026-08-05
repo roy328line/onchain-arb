@@ -1,0 +1,11 @@
+.env
+.env.*
+data/*.parquet
+data/*.db
+data/*.duckdb
+*.log
+__pycache__/
+node_modules/
+out/
+cache/
+broadcast/
