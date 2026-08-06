@@ -97,6 +97,66 @@ def price_impact(Q: float, pool_depth: float) -> float:
     return (Q ** 2) / pool_depth
 
 
+def price_impact_v2(
+    x: float,
+    y: float,
+    dx: float,
+    fee: float,
+) -> dict:
+    """
+    精確的 Uniswap v2 價格衝擊計算。
+
+    x, y  : 池中兩種 token 的儲備量（同單位，e.g. USD）
+    dx    : 買入量（x token，扣費前）
+    fee   : 池費率（e.g. 0.003 = 0.3%）
+
+    兩件事分開算：
+      1. effective_price  : 有效成交價 = 實際付出 dx，得到多少 dy
+                            dy = y * dx_net / (x + dx_net)
+                            effective_price = dy / dx   ← 含滑點的均價
+      2. spot_price_after : 成交後的邊際價格 = y' / x'
+                            x' = x + dx_net
+                            y' = k / x'  =  y - dy
+                            spot_price_after = y' / x'
+
+    兩者不同：effective_price 是整筆均價，spot_price_after 是下一單的起點。
+
+    Returns dict:
+        dy              實際得到的 y token 量
+        effective_price 有效成交均價（dy/dx，含滑點）
+        spot_price_before 成交前 spot price（y/x）
+        spot_price_after  成交後 spot price（y'/x'）
+        price_impact_pct  衝擊百分比（(before-after)/before）
+        fee_cost        實際扣掉的手續費（dx 單位）
+    """
+    if x <= 0 or y <= 0 or dx <= 0:
+        raise ValueError("x, y, dx 必須 > 0")
+
+    spot_before = y / x            # 成交前 spot price
+    fee_cost    = dx * fee         # 手續費（dx token）
+    dx_net      = dx * (1 - fee)   # 扣費後實際進池的量
+
+    # Uniswap v2 恆定乘積：x·y = k = (x + dx_net)(y - dy)
+    # → dy = y * dx_net / (x + dx_net)
+    dy = y * dx_net / (x + dx_net)
+
+    x_after     = x + dx_net
+    y_after     = y - dy
+    spot_after  = y_after / x_after
+
+    effective_price  = dy / dx     # 含費、含滑點的均價
+    impact_pct       = (spot_before - spot_after) / spot_before * 100
+
+    return {
+        "dy":                round(dy, 6),
+        "effective_price":   round(effective_price, 8),
+        "spot_price_before": round(spot_before, 8),
+        "spot_price_after":  round(spot_after, 8),
+        "price_impact_pct":  round(impact_pct, 6),
+        "fee_cost":          round(fee_cost, 6),
+    }
+
+
 def p_win_from_bribe(bribe_ratio: float, model: BribeModel) -> float:
     """
     內生 p_win：由 bribe_ratio 透過 sigmoid 決定。
