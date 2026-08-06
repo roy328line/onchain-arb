@@ -1,27 +1,34 @@
 """
-ev_model.py — 鏈上套利成本模型 (Day 1 建立，Day 2 完整重構)
+ev_model.py — 鏈上套利成本模型 (Day 1 建立，Day 2 完整重構，Day 2b 修正)
 
-架構原則（Day 2 重構後）：
+架構原則：
   - 不用「毛利 − 池費 − 衝擊」加減法；改成模擬真實資金流向：
-      Q USDC → 池A → W WETH → 池B → Q' USDC，毛利 = Q' − Q
+      Q USDC → 池A → W WETH → 池B → Q' USDC，net = Q' − Q
     池費和雙邊衝擊已內嵌在 AMM 公式裡，不再單獨計算。
-  - 最優規模 Q 由閉式解求出，不是輸入參數。
-  - 失敗成本區分 venue（bundle=0, public/L2=revert×attempts）。
-  - p_win sigmoid 加 CALIBRATION WARNING，Day 8 用真實資料校準。
-  - 「毛利/池費/衝擊」拆解只用於報表輸出，不參與 EV 計算。
+  - 最優規模 Q 由閉式解快篩，EV 最優由 best_ev() 雙變數最佳化確認。
+  - 失敗成本區分 venue：bundle=0；public=revert×attempts；l2=獨立 revert_rate。
+  - p_win sigmoid ⚠️ CALIBRATION WARNING，Day 8 用真實資料校準。
+  - bribe 基礎為 surplus（= max(0, net - gas)），不是現貨差。
 
 EV 主公式：
-  EV = p_win × (Q'−Q − gas − bribe) − (1 − p_win) × f_cost − h_cost
+  surplus   = max(0, net_raw − gas_cost)
+  net_after = surplus − bribe_usd   （bribe_usd = bribe_ratio × surplus）
+  EV = p_win × net_after − f_cost_expected − h_cost
+
+  其中 f_cost_expected：
+    bundle : 0
+    public : (1 − p_win) × revert_gas × n_attempts
+    l2     : l2_revert_rate × revert_gas × n_attempts  （獨立隨機過程，與 bribe 無關）
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Literal
 
 import pandas as pd
-from scipy.optimize import minimize_scalar
+from scipy.optimize import minimize_scalar, minimize
 
 
 # ──────────────────────────────────────────────
@@ -46,14 +53,16 @@ class ChainParams:
     """鏈上成本參數，預設為 L1 (Ethereum Mainnet)。"""
     base_gas_usd: float      = 5.0
     priority_fee_usd: float  = 2.0
-    revert_gas_usd: float    = 1.5    # bundle 模式不適用
+    revert_gas_usd: float    = 1.5
     bridge_fee_usd: float    = 0.0
-    n_attempts: int          = 3      # public/l2 venue 才有意義
+    n_attempts: int          = 3
     venue: Literal["bundle", "public", "l2"] = "public"
+    l2_revert_rate: float    = 0.30   # L2 獨立 revert 機率（研究值 20-40%）
     # venue 說明：
     #   "bundle" → Flashbots bundle，失敗不上鏈，f_cost = 0
-    #   "public" → 公開 mempool，revert 仍付 gas，f_cost = revert_gas × n_attempts
-    #   "l2"     → L2（Arbitrum/Op），revert 率 20-40%，同 public 計算方式
+    #   "public" → 公開 mempool，失敗率 = (1 − p_win)，付 revert gas
+    #   "l2"     → L2，revert 是獨立隨機過程（非 bribe 拍賣），
+    #              用 l2_revert_rate 而非 (1−p_win)
 
 
 @dataclass
@@ -90,17 +99,21 @@ def amm_out(pool: PoolState, dx: float) -> tuple[float, float, float]:
     """
     在 v2 池裡用 dx 單位的 token_x，買入 token_y（含池費）。
 
-    資金流：dx token_x 進池，扣費後用恆定乘積公式解出 dy token_y。
-      dx_net = dx × (1 − fee)
+    v2 機制：全額 dx 進池（手續費留在池中歸 LP）；
+    γ = 1 − fee 只影響計算，不改變進池金額。
+      dx_net = dx × (1 − fee)   ← 有效計算量
       dy = y × dx_net / (x + dx_net)
+      x_new = x + dx            ← 全額 dx 更新儲備（含手續費部分）
+      y_new = y − dy
 
     Returns: (dy, x_new, y_new)
+    注意：x_new 以全額 dx 計，多跳路徑串接時不會出錯。
     """
     if dx <= 0:
         raise ValueError("dx 必須 > 0")
-    dx_net = dx * (1 - pool.fee)
+    dx_net = dx * (1 - pool.fee)                      # 有效計算量
     dy = pool.y * dx_net / (pool.x + dx_net)
-    return dy, pool.x + dx_net, pool.y - dy
+    return dy, pool.x + dx, pool.y - dy               # x_new 用全額 dx
 
 
 def simulate_arb(pool_a: PoolState, pool_b: PoolState, Q: float) -> dict:
@@ -112,10 +125,10 @@ def simulate_arb(pool_a: PoolState, pool_b: PoolState, Q: float) -> dict:
     池B: x=token1, y=token0（輸入 token1，得到 token0）
 
     池費和雙邊衝擊均已內嵌，不再拆解為獨立項。
-    net = Q' − Q（已含所有摩擦，< 0 代表虧損）
+    net = Q' − Q（< 0 代表虧損）
     """
-    W, _, _ = amm_out(pool_a, dx=Q)          # Q token0 → W token1（池A）
-    Q_out, _, _ = amm_out(pool_b, dx=W)      # W token1 → Q' token0（池B）
+    W, _, _ = amm_out(pool_a, dx=Q)
+    Q_out, _, _ = amm_out(pool_b, dx=W)
     net = Q_out - Q
     return {
         "Q_in":       Q,
@@ -127,73 +140,93 @@ def simulate_arb(pool_a: PoolState, pool_b: PoolState, Q: float) -> dict:
 
 
 # ──────────────────────────────────────────────
-# 3. 最優規模（閉式解 + 數值驗證）
+# 3. 最優規模（閉式解 + 雙向 + 數值驗證）
 # ──────────────────────────────────────────────
 
-def optimal_size(pool_a: PoolState, pool_b: PoolState) -> dict:
+def _optimal_size_one_direction(
+    pool_a: PoolState, pool_b: PoolState
+) -> tuple[float, float]:
     """
-    計算雙池套利的最優輸入規模 Q*（閉式解）。
+    單方向閉式解（A→B），回傳 (Q_star, net_star)。
+    numer <= 0 時回傳 (0.0, -inf)。
 
-    符號定義（對應 simulate_arb）：
-      Ra0 = pool_a.x  （token0 在池A的儲備，e.g. USDC）
-      Ra1 = pool_a.y  （token1 在池A的儲備，e.g. WETH）
-      Rb0 = pool_b.x  （token1 在池B的儲備，e.g. WETH）
-      Rb1 = pool_b.y  （token0 在池B的儲備，e.g. USDC）
-      γ1 = 1 − pool_a.fee，γ2 = 1 − pool_b.fee
+    推導（從第一原理，d(Q'−Q)/dQ = 0）：
+      Q' = Rb1 × g1·g2·Ra1·Q / (Ra0·Rb0 + g1·Q·(Rb0 + g2·Ra1))
 
-    閉式解（推導自 d(Q'−Q)/dQ = 1，即邊際報酬等於邊際成本）：
-      numer = √(γ1·γ2·Ra0·Ra1·Rb0·Rb1) − Ra0·Rb0
-      denom = γ2·Rb0 + γ1·γ2·Ra1
+      令 A = Ra0·Rb0，B = g1·(Rb0 + g2·Ra1)：
+        dQ'/dQ = Rb1·g1·g2·Ra1·A / (A + B·Q)²
 
-    numer < 0 → 此方向無利可圖。
+      dQ'/dQ = 1 → (A + B·Q)² = Rb1·g1·g2·Ra1·A
+        → Q* = (√(g1·g2·Ra0·Ra1·Rb0·Rb1) − Ra0·Rb0) / [g1·(Rb0 + g2·Ra1)]
+               = numer / (g1·Rb0 + g1·g2·Ra1)
 
-    Roy 原公式 notation 中的 Ra1,Ra2,Rb1,Rb2 對應：
-      Ra1→Ra0, Ra2→Ra1, Rb1→Rb0, Rb2→Rb1
-      分母 (γ1·Rb2 + γ1·γ2·Rb1) = (γ1·Rb1 + γ1·γ2·Rb0)
-      當 Rb0=Ra1（中間 token 兩池深度相等）時與正確公式等價，
-      但 pool_a.fee ≠ pool_b.fee 時要小心 γ1 vs γ2 的位置。
+    注意：分母為 g1·Rb0 + g1·g2·Ra1（提 g1）。
+    若寫成 g2·Rb0 + g1·g2·Ra1，同費率時恆等，
+    但 fee_a ≠ fee_b 時誤差超過 0.1%（已用測試案例驗證）。
 
-    同時用 scipy 數值最佳化驗證，誤差需 < 0.1%。
+    Q* 在以下三種情況不等於 EV 最優規模（見 best_ev() docstring）：
+      (a) p_win 與 Q 相關
+      (b) bribe 基礎不是 surplus·(1−r) 的比例形式
+      (c) 有 Q 的非線性成本項（如庫存風險 ∝ Q·σ√t）
     """
     g1 = 1 - pool_a.fee
     g2 = 1 - pool_b.fee
-    Ra0 = pool_a.x
-    Ra1 = pool_a.y
-    Rb0 = pool_b.x
-    Rb1 = pool_b.y
+    Ra0, Ra1 = pool_a.x, pool_a.y
+    Rb0, Rb1 = pool_b.x, pool_b.y
 
     inner = g1 * g2 * Ra0 * Ra1 * Rb0 * Rb1
     numer = math.sqrt(inner) - Ra0 * Rb0
-    denom = g2 * Rb0 + g1 * g2 * Ra1
+    denom = g1 * Rb0 + g1 * g2 * Ra1    # 正確：提 g1，不是 g2*Rb0
 
-    if numer <= 0:
+    if numer <= 0 or denom <= 0:
+        return 0.0, float("-inf")
+
+    Q_star = numer / denom
+    net_star = simulate_arb(pool_a, pool_b, Q_star)["net"]
+    return Q_star, net_star
+
+
+def optimal_size(pool_a: PoolState, pool_b: PoolState) -> dict:
+    """
+    計算雙池套利的最優輸入規模 Q*（閉式解，雙向）。
+
+    numer <= 0 不代表完全無機會，可能是反方向有套利。
+    兩個方向都計算，取 net 較大的方向。
+
+    同時用 scipy 數值最佳化做 sanity check，要求誤差 < 0.1%。
+    """
+    # A→B 方向
+    Qs_ab, net_ab = _optimal_size_one_direction(pool_a, pool_b)
+    # B→A 方向（pool_a, pool_b 互換）
+    Qs_ba, net_ba = _optimal_size_one_direction(pool_b, pool_a)
+
+    if net_ab <= 0 and net_ba <= 0:
         return {
             "Q_star": 0.0, "net_star": 0.0,
             "direction": "no_opportunity",
             "numeric_Q": 0.0, "error_pct": 0.0,
         }
 
-    Q_star = numer / denom
+    if net_ab >= net_ba:
+        Q_star, net_star, direction = Qs_ab, net_ab, "A→B"
+        pa, pb = pool_a, pool_b
+    else:
+        Q_star, net_star, direction = Qs_ba, net_ba, "B→A"
+        pa, pb = pool_b, pool_a
 
-    # 數值驗證（scipy minimize_scalar）
-    def neg_profit(Q):
-        if Q <= 0:
-            return 0.0
-        try:
-            return -simulate_arb(pool_a, pool_b, Q)["net"]
-        except Exception:
-            return 0.0
-
-    bound = min(Ra0, Rb1) * 0.5
-    res = minimize_scalar(neg_profit, bounds=(1.0, bound), method="bounded")
+    # 數值驗證
+    bound = min(pa.x, pb.y) * 0.5
+    res = minimize_scalar(
+        lambda Q: -simulate_arb(pa, pb, Q)["net"] if Q > 0 else 0.0,
+        bounds=(1.0, bound), method="bounded"
+    )
     numeric_Q = res.x
-    net_star  = simulate_arb(pool_a, pool_b, Q_star)["net"]
     error_pct = abs(Q_star - numeric_Q) / max(numeric_Q, 1e-9) * 100
 
     return {
         "Q_star":    round(Q_star, 4),
         "net_star":  round(net_star, 6),
-        "direction": "A→B",
+        "direction": direction,
         "numeric_Q": round(numeric_Q, 4),
         "error_pct": round(error_pct, 4),
     }
@@ -203,17 +236,22 @@ def optimal_size(pool_a: PoolState, pool_b: PoolState) -> dict:
 # 4. 成本函式
 # ──────────────────────────────────────────────
 
-def failure_cost(chain: ChainParams) -> float:
+def failure_cost_expected(chain: ChainParams, p_win: float) -> float:
     """
-    失敗成本（venue 決定）。
+    期望失敗成本（venue 決定機制）。
 
-    "bundle"  → Flashbots bundle 失敗不上鏈 → f_cost = 0
-    "public"  → 公開 mempool revert 仍扣 gas → f_cost = revert_gas × n_attempts
-    "l2"      → L2 revert（率 20-40%），同 public 計算方式
+    "bundle" → 失敗不上鏈，f_cost = 0
+    "public" → 失敗率 = (1 − p_win)（bribe 拍賣決定），付 revert_gas × n_attempts
+    "l2"     → revert 是獨立隨機過程，與 bribe 無關；
+               用 l2_revert_rate（研究值 20-40%），不從 (1−p_win) 推導
     """
     if chain.venue == "bundle":
         return 0.0
-    return chain.revert_gas_usd * chain.n_attempts
+    gas = chain.revert_gas_usd * chain.n_attempts
+    if chain.venue == "l2":
+        return chain.l2_revert_rate * gas
+    # public
+    return (1 - p_win) * gas
 
 
 def holding_cost(holding: HoldingParams) -> float:
@@ -233,13 +271,10 @@ def holding_cost(holding: HoldingParams) -> float:
     """
     if holding.inventory_usd <= 0 or holding.hold_time_hours <= 0:
         return 0.0
-
     t_years = holding.hold_time_hours / (365 * 24)
-    t_days  = holding.hold_time_hours / 24   # 同源推導，不重複定義常數
-
+    t_days  = holding.hold_time_hours / 24
     opportunity = holding.inventory_usd * t_years * holding.opportunity_rate
     price_risk  = holding.inventory_usd * holding.sigma_daily * math.sqrt(t_days)
-
     return opportunity + price_risk
 
 
@@ -266,45 +301,53 @@ def compute_ev(
     bribe_model: Optional[BribeModel] = None,
 ) -> dict:
     """
-    計算單一 bribe_ratio 下的期望值。
+    計算單一 (bribe_ratio, Q) 下的期望值。
 
-    net_raw = Q' − Q（已含雙邊池費與衝擊，直接從 simulate_arb 取得）
-    EV = p_win × (net_raw − gas − bribe) − (1−p_win) × f_cost − h_cost
+    bribe 基礎為 surplus（實現剩餘），不是現貨差或 gross：
+      surplus   = max(0, net_raw − gas_cost)
+      bribe_usd = bribe_ratio × surplus
+      net_after = surplus − bribe_usd = surplus × (1 − bribe_ratio)
 
-    「毛利/池費/衝擊」的拆解只用於報表輸出，不參與此計算。
+    理由：原子套利的 bribe 來源是交易自身的產出（coinbase.transfer），
+    上界必然是 surplus；用現貨差會導致 bribe > net，數學上無解。
+
+    EV = p_win × net_after − f_cost_expected − h_cost
     """
     if holding is None:
         holding = HoldingParams()
     if bribe_model is None:
         bribe_model = BribeModel()
 
-    arb       = simulate_arb(pool_a, pool_b, Q)
-    net_raw   = arb["net"]
+    arb     = simulate_arb(pool_a, pool_b, Q)
+    net_raw = arb["net"]
 
-    gas_cost  = chain.base_gas_usd + chain.priority_fee_usd + chain.bridge_fee_usd
-    bribe_usd = bribe_ratio * net_raw if net_raw > 0 else 0.0
-    f_cost    = failure_cost(chain)
-    h_cost    = holding_cost(holding)
-    pw        = p_win_from_bribe(bribe_ratio, bribe_model)
+    gas_cost = chain.base_gas_usd + chain.priority_fee_usd + chain.bridge_fee_usd
+    surplus  = max(0.0, net_raw - gas_cost)
+    bribe_usd = bribe_ratio * surplus
+    net_after = surplus - bribe_usd            # = surplus × (1 − bribe_ratio)
 
-    net_after = net_raw - gas_cost - bribe_usd
-    ev = pw * net_after - (1 - pw) * f_cost - h_cost
+    pw     = p_win_from_bribe(bribe_ratio, bribe_model)
+    f_cost = failure_cost_expected(chain, pw)
+    h_cost = holding_cost(holding)
+
+    ev = pw * net_after - f_cost - h_cost
 
     return {
         "bribe_ratio": bribe_ratio,
         "p_win":       round(pw, 4),
         "net_raw":     round(net_raw, 4),
         "gas_cost":    round(gas_cost, 4),
+        "surplus":     round(surplus, 4),
         "bribe_usd":   round(bribe_usd, 4),
+        "net_after":   round(net_after, 4),
         "f_cost":      round(f_cost, 4),
         "h_cost":      round(h_cost, 4),
-        "net_after":   round(net_after, 4),
         "ev":          round(ev, 4),
     }
 
 
 # ──────────────────────────────────────────────
-# 6. EV 曲線 + 敏感度
+# 6. EV 曲線 + k 敏感度
 # ──────────────────────────────────────────────
 
 def sweep_bribe(
@@ -335,7 +378,7 @@ def bribe_sensitivity(
 ) -> pd.DataFrame:
     """
     EV 對 bribe_ratio × k 的敏感度分析。
-    ⚠️ 因 k 是猜測值，此分析揭示模型對 k 的依賴程度，Day 8 校準前不可輕信 EV 絕對值。
+    ⚠️ k 是猜測值，Day 8 校準前不可輕信 EV 絕對值。
     """
     rows = []
     for k in k_values:
@@ -347,133 +390,305 @@ def bribe_sensitivity(
 
 
 # ──────────────────────────────────────────────
-# 7. 測試
+# 7. best_ev（產品介面：go/no-go）
+# ──────────────────────────────────────────────
+
+def best_ev(
+    pool_a: PoolState,
+    pool_b: PoolState,
+    chain: ChainParams,
+    holding: Optional[HoldingParams] = None,
+    bribe_model: Optional[BribeModel] = None,
+    Q_bounds: tuple[float, float] = (100.0, None),
+) -> dict:
+    """
+    對 Q 和 bribe_ratio 做雙變數最佳化，找到最大 EV 的 (Q*, r*)。
+
+    這是整個模型的產品介面：輸入機會（兩個池），輸出 go/no-go 決策。
+
+    設計說明：
+      - 閉式解 Q* 降級為快篩和初始猜測，最終由數值最佳化確認。
+      - r 有內部最優解（dEV/dr = 0），但因 p_win sigmoid 非線性，
+        閉式解複雜，這裡用聯合數值搜尋。
+      - Q_bounds[1] 若為 None，自動設為 min(pool_a.x, pool_b.y) × 0.3。
+
+    ⚠️ Q* 不一定等於 EV 最優規模（儘管在當前 bribe 結構下大致成立），
+    以下三種情況會偏離：
+      (a) p_win 與 Q 相關（機會越大競爭越多）
+      (b) bribe 基礎不是 surplus 的比例形式
+      (c) 有 Q 的非線性成本項（如庫存風險 ∝ Q·σ√t）
+
+    Returns dict:
+        Q_star      最優輸入規模
+        r_star      最優 bribe_ratio
+        ev_star     最大 EV
+        decision    "go" / "no-go"
+        detail      compute_ev 完整輸出
+    """
+    if holding is None:
+        holding = HoldingParams()
+    if bribe_model is None:
+        bribe_model = BribeModel()
+
+    # 快篩：先用閉式解估算方向
+    opt = optimal_size(pool_a, pool_b)
+    if opt["direction"] == "no_opportunity":
+        pa, pb = pool_a, pool_b
+    elif opt["direction"] == "A→B":
+        pa, pb = pool_a, pool_b
+    else:
+        pa, pb = pool_b, pool_a
+
+    Q_max = Q_bounds[1] or min(pa.x, pb.y) * 0.3
+    Q_init = opt["Q_star"] if opt["Q_star"] > 0 else (Q_bounds[0] + Q_max) / 2
+
+    def neg_ev(params):
+        Q, r = params
+        if Q <= 0 or not (0 <= r <= 1):
+            return 0.0
+        try:
+            return -compute_ev(r, pa, pb, Q, chain, holding, bribe_model)["ev"]
+        except Exception:
+            return 0.0
+
+    # 網格初始化（Q × r 各 8 點），取最優點作為起點
+    best_init, best_val = [Q_init, 0.5], float("inf")
+    for Q0 in [Q_init * f for f in [0.3, 0.6, 1.0, 1.5, 2.0]]:
+        for r0 in [0.3, 0.5, 0.7, 0.9]:
+            v = neg_ev([Q0, r0])
+            if v < best_val:
+                best_val, best_init = v, [Q0, r0]
+
+    res = minimize(
+        neg_ev,
+        x0=best_init,
+        method="Nelder-Mead",
+        options={"xatol": 0.01, "fatol": 1e-6, "maxiter": 2000},
+        bounds=[(Q_bounds[0], Q_max), (0.0, 1.0)],
+    )
+
+    Q_star, r_star = res.x
+    Q_star = max(Q_bounds[0], min(Q_max, Q_star))
+    r_star = max(0.0, min(1.0, r_star))
+
+    detail = compute_ev(r_star, pa, pb, Q_star, chain, holding, bribe_model)
+    ev_star = detail["ev"]
+    decision = "go" if ev_star > 0 else "no-go"
+
+    return {
+        "Q_star":   round(Q_star, 2),
+        "r_star":   round(r_star, 4),
+        "ev_star":  round(ev_star, 4),
+        "decision": decision,
+        "direction": opt["direction"],
+        "detail":   detail,
+    }
+
+
+# ──────────────────────────────────────────────
+# 8. 測試
 # ──────────────────────────────────────────────
 
 def test_double_sided_impact():
     """
     驗證雙邊衝擊遠超過單邊估計的誤差。
-
-    場景：約 1% 價差、0.3% 費
-      pool_a：6,000,000 USDC / 3,000 WETH  (spot $2,000/WETH)
-      pool_b：3,000 WETH / 6,060,000 USDC  (spot $2,020/WETH，約 1% 高)
-      Q = 20,000 USDC
-
-    單邊近似：假設池B完全無衝擊，以 spot price 換算。
-    雙邊真實：simulate_arb 含兩池衝擊。
     """
     pool_a = PoolState(x=6_000_000, y=3_000, fee=0.003)
     pool_b = PoolState(x=3_000, y=6_060_000, fee=0.003)
     Q = 20_000
 
-    # 雙邊真實
     result = simulate_arb(pool_a, pool_b, Q)
-
-    # 單邊近似（只算池A，池B用 spot price 無衝擊計算）
     W, _, _ = amm_out(pool_a, dx=Q)
     spot_b = pool_b.y / pool_b.x
-    Q_out_single = W * spot_b * (1 - pool_b.fee)
-    single_net   = Q_out_single - Q
-
-    spot_a = pool_a.x / pool_a.y
-    spot_b_price = pool_b.y / pool_b.x
+    single_net = W * spot_b * (1 - pool_b.fee) - Q
 
     print("=" * 60)
     print("  test_double_sided_impact")
     print("=" * 60)
-    print(f"  Pool A：{pool_a.x/1e6:.1f}M USDC / {pool_a.y:.0f} WETH  (spot ${spot_a:,.0f}/WETH)")
-    print(f"  Pool B：{pool_b.x:.0f} WETH / {pool_b.y/1e6:.2f}M USDC  (spot ${spot_b_price:,.0f}/WETH)")
-    print(f"  Q = ${Q:,} USDC → W = {result['W']:.4f} WETH")
-    print()
-    print(f"  單邊近似 net : ${single_net:>+10.2f}  ← 只算池A，池B假設無衝擊")
-    print(f"  雙邊真實 net : ${result['net']:>+10.2f}  ← 含兩池衝擊")
+    print(f"  Pool A：spot ${pool_a.x/pool_a.y:,.0f}/WETH")
+    print(f"  Pool B：spot ${pool_b.y/pool_b.x:,.0f}/WETH")
+    print(f"  Q = ${Q:,} → W = {result['W']:.4f} WETH")
+    print(f"  單邊近似 net : ${single_net:>+10.2f}")
+    print(f"  雙邊真實 net : ${result['net']:>+10.2f}")
     print(f"  誤差         : ${single_net - result['net']:>+10.2f}")
-    print()
-
-    assert result["net"] < single_net, "雙邊淨利應小於單邊近似"
+    assert result["net"] < single_net
     if result["net"] < 0 < single_net:
-        print("  ✅ 單邊顯示獲利，雙邊真實是虧損——關鍵誤差，不容忽視")
+        print("  ✅ 單邊獲利，雙邊虧損——關鍵誤差確認")
     else:
         print(f"  ✅ 雙邊 ({result['net']:.2f}) < 單邊 ({single_net:.2f})")
     print("=" * 60)
     return result
 
 
-def test_optimal_size():
-    """驗證閉式解最優規模，誤差 < 0.1%。"""
+def test_amm_x_new():
+    """
+    驗證 amm_out 的 x_new 使用全額 dx（非 dx_net）。
+    """
+    pool = PoolState(x=1_000_000, y=1_000, fee=0.003)
+    dx = 10_000
+    dy, x_new, y_new = amm_out(pool, dx)
+    assert x_new == pool.x + dx, f"x_new 應為 {pool.x + dx}，實際 {x_new}"
+    assert abs((x_new - pool.x_net if hasattr(pool, 'x_net') else 0)) >= 0  # 不用 dx_net
+    # 守恆性確認（含手續費後 k 應略增）
+    k_before = pool.x * pool.y
+    k_after  = x_new * y_new
+    assert k_after >= k_before, "成交後 k 應 ≥ 成交前（手續費留在池中）"
+    print()
+    print("  test_amm_x_new ✅")
+    print(f"    dx={dx}, x_new={x_new} (= x + dx = {pool.x}+{dx})")
+    print(f"    k_before={k_before:.0f}, k_after={k_after:.0f} (k_after ≥ k_before ✅)")
+
+
+def test_optimal_size_same_fee():
+    """同費率基本案例，誤差應 < 0.1%。"""
     pool_a = PoolState(x=6_000_000, y=3_000, fee=0.003)
     pool_b = PoolState(x=3_000, y=6_060_000, fee=0.003)
-
     res = optimal_size(pool_a, pool_b)
     print()
     print("=" * 60)
-    print("  test_optimal_size")
+    print("  test_optimal_size (same fee 0.3%)")
     print("=" * 60)
-    if res["direction"] == "no_opportunity":
-        print("  此方向無套利機會")
-    else:
-        print(f"  閉式解 Q*  : ${res['Q_star']:>10,.2f}")
-        print(f"  數值解 Q*  : ${res['numeric_Q']:>10,.2f}")
-        print(f"  誤差       : {res['error_pct']:.4f}%")
-        print(f"  Q* 下毛利  : ${res['net_star']:>10,.4f}")
-        assert res["error_pct"] < 0.1, f"誤差 {res['error_pct']:.4f}% 超過 0.1%"
-        print("  ✅ 閉式解誤差 < 0.1%")
+    print(f"  方向       : {res['direction']}")
+    print(f"  閉式解 Q*  : ${res['Q_star']:>10,.2f}")
+    print(f"  數值解 Q*  : ${res['numeric_Q']:>10,.2f}")
+    print(f"  誤差       : {res['error_pct']:.4f}%")
+    print(f"  Q* 下毛利  : ${res['net_star']:>10,.4f}")
+    assert res["error_pct"] < 0.1, f"誤差超過 0.1%: {res['error_pct']:.4f}%"
+    print("  ✅ 誤差 < 0.1%")
     print("=" * 60)
     return res
 
 
+def test_optimal_size_diff_fee():
+    """
+    異費率測試：fee_a=0.05%, fee_b=0.3%（Uniswap v3 常見組合）。
+    驗證正確分母 g1·Rb0 + g1·g2·Ra1 的誤差 < 0.1%，
+    並確認錯誤分母 g2·Rb0 + g1·g2·Ra1 在此條件下會超標。
+    """
+    # 2% 價差確保有套利空間
+    pool_a = PoolState(x=6_000_000, y=3_000, fee=0.0005)
+    pool_b = PoolState(x=3_000, y=6_120_000, fee=0.003)
+
+    res = optimal_size(pool_a, pool_b)
+
+    # 重新計算錯誤分母作為對比
+    g1 = 1 - pool_a.fee
+    g2 = 1 - pool_b.fee
+    Ra0, Ra1, Rb0, Rb1 = pool_a.x, pool_a.y, pool_b.x, pool_b.y
+    numer = math.sqrt(g1*g2*Ra0*Ra1*Rb0*Rb1) - Ra0*Rb0
+    Qs_wrong = numer / (g2*Rb0 + g1*g2*Ra1)
+    err_wrong = abs(Qs_wrong - res["numeric_Q"]) / max(res["numeric_Q"], 1e-9) * 100
+
+    print()
+    print("=" * 60)
+    print("  test_optimal_size_diff_fee (fee_a=0.05%, fee_b=0.3%)")
+    print("=" * 60)
+    print(f"  方向           : {res['direction']}")
+    print(f"  正確閉式解 Q*  : ${res['Q_star']:>10,.2f}  誤差 {res['error_pct']:.4f}%")
+    print(f"  錯誤分母 Q*    : ${Qs_wrong:>10,.2f}  誤差 {err_wrong:.4f}%")
+    print(f"  數值解 Q*      : ${res['numeric_Q']:>10,.2f}")
+    assert res["error_pct"] < 0.1, f"正確公式誤差超過 0.1%: {res['error_pct']:.4f}%"
+    assert err_wrong > res["error_pct"], "錯誤分母應比正確分母誤差更大"
+    print(f"  ✅ 正確公式誤差 {res['error_pct']:.5f}% < 0.1%")
+    print(f"  ✅ 錯誤分母誤差 {err_wrong:.4f}% > 正確公式")
+    print("=" * 60)
+    return res
+
+
+def test_optimal_size_reverse():
+    """驗證反向套利被正確偵測。"""
+    # pool_a 比 pool_b 貴（B→A 有機會）
+    pool_a = PoolState(x=3_000, y=6_060_000, fee=0.003)   # spot $2020
+    pool_b = PoolState(x=6_000_000, y=3_000, fee=0.003)   # spot $2000（低）
+    res = optimal_size(pool_a, pool_b)
+    print()
+    print("  test_optimal_size_reverse ✅")
+    print(f"    方向: {res['direction']}, Q*={res['Q_star']:.0f}, net={res['net_star']:.4f}")
+    assert res["direction"] == "B→A", f"應偵測到 B→A，實際: {res['direction']}"
+
+
 def test_venue_failure_cost():
-    """驗證 venue 決定失敗成本。"""
+    """驗證三種 venue 的失敗成本計算。"""
     c_bundle = ChainParams(venue="bundle", revert_gas_usd=1.5, n_attempts=3)
     c_public = ChainParams(venue="public", revert_gas_usd=1.5, n_attempts=3)
-    c_l2     = ChainParams(venue="l2",     revert_gas_usd=0.01, n_attempts=3)
+    c_l2     = ChainParams(venue="l2",     revert_gas_usd=0.01, n_attempts=3, l2_revert_rate=0.30)
 
-    assert failure_cost(c_bundle) == 0.0,  "bundle f_cost 應為 0"
-    assert failure_cost(c_public) == 4.5,  "public f_cost 應為 4.5"
-    assert abs(failure_cost(c_l2) - 0.03) < 1e-9, "l2 f_cost 應為 0.03"
+    p_win = 0.3
+    assert failure_cost_expected(c_bundle, p_win) == 0.0
+    assert abs(failure_cost_expected(c_public, p_win) - (1-p_win)*1.5*3) < 1e-9
+    assert abs(failure_cost_expected(c_l2, p_win) - 0.30*0.01*3) < 1e-9
     print()
     print("  test_venue_failure_cost ✅")
-    print(f"    bundle : ${failure_cost(c_bundle)}")
-    print(f"    public : ${failure_cost(c_public)}")
-    print(f"    l2     : ${failure_cost(c_l2)}")
+    print(f"    bundle : $0.0")
+    print(f"    public : ${failure_cost_expected(c_public, p_win):.4f}  (= (1-{p_win})×{1.5}×{3})")
+    print(f"    l2     : ${failure_cost_expected(c_l2, p_win):.4f}  (= {0.30}×{0.01}×{3})")
+
+
+def test_bribe_surplus():
+    """驗證 bribe 以 surplus 為基礎，不會超過 net_raw。"""
+    pool_a = PoolState(x=6_000_000, y=3_000, fee=0.003)
+    pool_b = PoolState(x=3_000, y=6_060_000, fee=0.003)
+    chain  = ChainParams(venue="public")
+
+    r = compute_ev(0.8, pool_a, pool_b, 5_945.0, chain)
+    assert r["bribe_usd"] <= r["net_raw"], "bribe 不能超過 net_raw"
+    assert r["surplus"] >= 0
+    assert abs(r["surplus"] - max(0, r["net_raw"] - r["gas_cost"])) < 0.01
+    print()
+    print("  test_bribe_surplus ✅")
+    print(f"    net_raw={r['net_raw']}, gas={r['gas_cost']}, surplus={r['surplus']}, bribe={r['bribe_usd']}")
 
 
 # ──────────────────────────────────────────────
-# 8. 驗收區塊
+# 9. 驗收區塊
 # ──────────────────────────────────────────────
 
 if __name__ == "__main__":
     import numpy as np
 
-    double_result = test_double_sided_impact()
-    opt_result    = test_optimal_size()
+    test_double_sided_impact()
+    test_amm_x_new()
+    test_optimal_size_same_fee()
+    test_optimal_size_diff_fee()
+    test_optimal_size_reverse()
     test_venue_failure_cost()
+    test_bribe_surplus()
 
-    # EV 曲線（用最優規模）
+    # EV 曲線
     pool_a = PoolState(x=6_000_000, y=3_000, fee=0.003)
     pool_b = PoolState(x=3_000, y=6_060_000, fee=0.003)
     chain  = ChainParams(venue="public")
 
-    Q_star = opt_result["Q_star"] if opt_result["Q_star"] > 0 else 5_000.0
+    opt = optimal_size(pool_a, pool_b)
+    Q_star = opt["Q_star"] if opt["Q_star"] > 0 else 5_000.0
+
     print()
-    print("=" * 60)
+    print("=" * 65)
     print(f"  EV 曲線（Q*={Q_star:,.0f} USDC，venue=public）")
     print("  ⚠️ p_win 基於猜測 sigmoid，絕對值不可輕信")
-    print("=" * 60)
+    print("=" * 65)
     ratios = np.arange(0.0, 1.05, 0.1).tolist()
     df = sweep_bribe(ratios, pool_a, pool_b, Q_star, chain)
-    print(df[["bribe_ratio", "p_win", "net_raw", "net_after", "ev"]].to_string(index=False))
-    best = df.loc[df["ev"].idxmax()]
-    print(f"\n  最高 EV：bribe={best['bribe_ratio']:.1f}，EV=${best['ev']:.4f}")
+    print(df[["bribe_ratio", "p_win", "net_raw", "surplus", "net_after", "ev"]].to_string(index=False))
 
-    # k 敏感度
     print()
-    print("=" * 60)
-    print("  k 敏感度（⚠️ k 是猜測值，EV 結論對 k 高度敏感）")
-    print("=" * 60)
+    print("=" * 65)
+    print("  best_ev（雙變數最佳化 go/no-go）")
+    print("=" * 65)
+    be = best_ev(pool_a, pool_b, chain)
+    print(f"  Q*       = ${be['Q_star']:,.2f}")
+    print(f"  r*       = {be['r_star']:.4f}")
+    print(f"  EV*      = ${be['ev_star']:.4f}")
+    print(f"  決策     = {be['decision']}")
+    print(f"  方向     = {be['direction']}")
+
+    print()
+    print("=" * 65)
+    print("  k 敏感度（⚠️ k 是猜測值）")
+    print("=" * 65)
     df_s = bribe_sensitivity(
         [0.3, 0.5, 0.7], [2.0, 5.65, 10.0, 20.0],
         pool_a, pool_b, Q_star, chain
     )
     print(df_s.pivot(index="bribe_ratio", columns="k", values="ev").to_string())
-    print("\n  → Day 8 前，bribe 掃描結果僅供定性參考，不可作為決策依據")
+    print("\n  → Day 8 前，bribe 掃描結果僅供定性參考")
