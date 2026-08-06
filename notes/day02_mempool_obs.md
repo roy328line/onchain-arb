@@ -8,11 +8,12 @@
 
 ## 觀察結果
 
-（WebSocket 跑完後填入）
+**節點：** wss://ethereum.publicnode.com
+**時長：** 600 秒（10 分鐘）
 
-- 看到幾筆 pending tx：___
-- 其中幾筆是 DEX swap：___
-- swap 佔比：___%
+- 看到幾筆 pending tx：**11,020 筆**（約 18 筆/秒）
+- 其中幾筆是 DEX swap：**2 筆**（selector 比對）
+- swap 佔比：**0.02%**
 
 ---
 
