@@ -486,8 +486,106 @@ def best_ev(
 
 
 # ──────────────────────────────────────────────
-# 8. 測試
+# 8. LiFi 費用轉換（跨鏈套利用）
 # ──────────────────────────────────────────────
+
+def lifi_quote_to_chain_params(
+    quote: dict,
+    base: Optional[ChainParams] = None,
+) -> ChainParams:
+    """
+    把 LiFi /quote 或 /advanced/routes 的單條路由，
+    轉換成可傳入 compute_ev / best_ev 的 ChainParams。
+
+    費用處理規則（來自 LiFi API 文件 + 實測）：
+      gasCosts[]         → 額外付給礦工，加進 base_gas_usd
+      feeCosts[included=True]  → 已從 toAmount 扣除，不重複計
+      feeCosts[included=False] → 尚未扣除，加進 bridge_fee_usd
+
+    ⚠️ 最常見 bug：把 included=True 的費用再扣一次（重複計費）。
+       本函式確保只計算「你還需要額外付出去」的費用。
+
+    Args:
+        quote: LiFi /quote 的 JSON response（整個 dict）
+        base:  基礎 ChainParams（保留 venue / revert_gas 等設定）
+
+    Returns:
+        新的 ChainParams，bridge_fee_usd 已填入 LiFi 費用
+    """
+    if base is None:
+        base = ChainParams()
+
+    est = quote.get("estimate", {})
+
+    # gasCosts：額外付 ETH 給礦工
+    gas_usd = sum(
+        float(g.get("amountUSD", 0))
+        for g in est.get("gasCosts", [])
+    )
+
+    # feeCosts：只加 included=False（included=True 已在 toAmount 裡扣了）
+    extra_fee_usd = sum(
+        float(f.get("amountUSD", 0))
+        for f in est.get("feeCosts", [])
+        if not f.get("included", True)
+    )
+
+    # 摘要（供 debug）
+    included_fees = sum(
+        float(f.get("amountUSD", 0))
+        for f in est.get("feeCosts", [])
+        if f.get("included", True)
+    )
+
+    return ChainParams(
+        base_gas_usd     = base.base_gas_usd,
+        priority_fee_usd = gas_usd,          # LiFi gas 放在 priority_fee 欄位
+        revert_gas_usd   = base.revert_gas_usd,
+        bridge_fee_usd   = extra_fee_usd,    # 只有 included=False 才是額外成本
+        n_attempts       = base.n_attempts,
+        venue            = base.venue,
+        l2_revert_rate   = base.l2_revert_rate,
+        # 備註欄位（不進計算，供人工核對）
+        # _lifi_gas_usd          = gas_usd
+        # _lifi_included_fee_usd = included_fees  ← 已在 toAmount 扣，不算
+        # _lifi_extra_fee_usd    = extra_fee_usd
+    )
+
+
+def lifi_net_raw(quote: dict) -> float:
+    """
+    從 LiFi quote 直接算出 net_raw（= toAmount_USD - fromAmount_USD）。
+
+    跨鏈套利用：不需要 simulate_arb，直接用 LiFi 報價的 toAmount。
+    注意：toAmount 已扣除 included=True 的費用，是真實到手金額。
+
+    Args:
+        quote: LiFi /quote 的 JSON response
+
+    Returns:
+        net_raw（USD），正數代表有毛利（扣除 included 費用後）
+    """
+    act = quote.get("action", {})
+    est = quote.get("estimate", {})
+
+    from_token = act.get("fromToken", {})
+    to_token   = act.get("toToken", {})
+    from_dec   = from_token.get("decimals", 6)
+    to_dec     = to_token.get("decimals", 6)
+
+    from_price = float(from_token.get("priceUSD", 1.0))
+    to_price   = float(to_token.get("priceUSD", 1.0))
+
+    from_amount = int(act.get("fromAmount", 0)) / (10 ** from_dec)
+    to_amount   = int(est.get("toAmount", 0))   / (10 ** to_dec)
+
+    from_usd = from_amount * from_price
+    to_usd   = to_amount   * to_price
+
+    return round(to_usd - from_usd, 6)
+
+
+
 
 def test_double_sided_impact():
     """
