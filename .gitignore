@@ -9,3 +9,4 @@ node_modules/
 out/
 cache/
 broadcast/
+scripts/tycho-client
