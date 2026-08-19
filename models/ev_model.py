@@ -23,11 +23,9 @@ EV 主公式：
 """
 
 from __future__ import annotations
-
 import math
 from dataclasses import dataclass, field
-from typing import Optional, Literal
-
+from typing import Optional, Literal, Protocol
 import pandas as pd
 from scipy.optimize import minimize_scalar, minimize
 
@@ -75,6 +73,94 @@ class Leg:
     fee:        float
 
 
+# ──────────────────────────────────────────────
+# 1b. 通用腿介面（Day 9：支援非 AMM 腿）
+# ──────────────────────────────────────────────
+
+@dataclass
+class CashFlow:
+    """
+    一筆現金流。正=流入本策略，負=流出。
+
+    t_hours : 相對進場的時間（0=立即，672=28天）
+    kind    : "principal"=本金；"yield"=利息/資金費；"fee"=手續費/結算費
+    floating: 是否為浮動項（用於自動驗算浮動對消）
+    counterparty: 來源場所（用於跨場所浮動對消驗算）
+    """
+    asset:        str
+    amount:       float
+    t_hours:      float
+    kind:         Literal["principal", "yield", "fee"] = "principal"
+    floating:     bool = False
+    counterparty: str  = ""
+
+
+@dataclass
+class Margin:
+    """
+    佔用的保證金。
+
+    cross_margined_with: 與哪些倉位共用保證金
+    （當兩腿跨平台 cross-margin，清算條件要聯合評估）
+    """
+    asset:               str
+    amount:              float
+    venue:               str
+    cross_margined_with: list[str] = field(default_factory=list)
+
+
+@dataclass
+class LiquidationCondition:
+    """
+    清算觸發條件。
+
+    driver    : 驅動因素 —— "price" / "implied_apr" / "health_factor"
+    direction : "up" = 上漲觸發（short 被清算）；"down" = 下跌觸發（long 被清算）
+    threshold : 觸發值（None = 未知/需動態計算）
+    note      : 補充說明
+    """
+    driver:    str
+    direction: Literal["up", "down"]
+    threshold: float | None
+    note:      str = ""
+
+
+@dataclass
+class LegResult:
+    """
+    一條腿的評估結果。
+
+    flows       : 所有現金流（含本金、利息、費用）
+    margins     : 佔用的保證金列表
+    delta       : 資產 → USD 計價的價格曝險（正=多頭，負=空頭）
+    liquidations: 清算條件列表
+    exit_ok     : 退出通道是否暢通（False = 需評估深度/鎖倉）
+    atomic      : 是否原子（False = 部分成交後暴露庫存風險）
+    meta        : 額外資訊（e.g. 槓桿率、固定利率、到期日）
+    """
+    flows:       list[CashFlow]
+    margins:     list[Margin]
+    delta:       dict[str, float]
+    liquidations: list[LiquidationCondition]
+    exit_ok:     bool
+    exit_note:   str  = ""
+    atomic:      bool = True
+    meta:        dict = field(default_factory=dict)
+
+
+class LegProtocol(Protocol):
+    """
+    通用腿介面（Day 9）。
+
+    所有腿（AMM swap / Perp funding / Boros YU / 橋 / 借貸）
+    都實作 evaluate()，讓上層模型統一處理現金流、delta、清算條件。
+
+    notional      : 本腿名目規模（USD）
+    horizon_hours : 持有時間（小時）
+    """
+    def evaluate(self, notional: float, horizon_hours: float) -> LegResult: ...
+
+
 @dataclass
 class ChainParams:
     """鏈上成本參數，預設為 L1 (Ethereum Mainnet)。"""
@@ -83,22 +169,37 @@ class ChainParams:
     revert_gas_usd: float    = 1.5
     bridge_fee_usd: float    = 0.0
     n_attempts: int          = 3
-    venue: Literal["bundle", "public", "l2"] = "public"
+    venue: Literal["bundle", "public", "l2", "multi_venue"] = "public"
     l2_revert_rate: float    = 0.30   # L2 獨立 revert 機率（研究值 20-40%）
     # venue 說明：
-    #   "bundle" → Flashbots bundle，失敗不上鏈，f_cost = 0
-    #   "public" → 公開 mempool，失敗率 = (1 − p_win)，付 revert gas
-    #   "l2"     → L2，revert 是獨立隨機過程（非 bribe 拍賣），
-    #              用 l2_revert_rate 而非 (1−p_win)
+    #   "bundle"      → Flashbots bundle，失敗不上鏈，f_cost = 0
+    #   "public"      → 公開 mempool，失敗率 = (1 − p_win)，付 revert gas
+    #   "l2"          → L2，revert 是獨立隨機過程（非 bribe 拍賣）
+    #   "multi_venue" → 跨場所非原子：單腿失敗 = 裸露曝險，
+    #                   f_cost 不是 gas，是「被迫市價平倉」成本
 
 
 @dataclass
 class HoldingParams:
-    """資金持有成本參數。Atomic arb 全部為 0。"""
-    inventory_usd: float     = 0.0
-    hold_time_hours: float   = 0.0
-    opportunity_rate: float  = 0.05   # 年化利率
-    sigma_daily: float       = 0.03   # 日波動率
+    """
+    資金持有成本參數。Atomic arb 全部為 0。
+
+    Day 9 修正：拆出 inventory_usd / delta_exposure_usd
+    ──────────────────────────────────────────────────
+    原本 price_risk = inventory_usd × σ × √t 對 delta-neutral 策略是錯的：
+    Boros 四腿佔用 $288,621 資本，但 delta 完全對消（ETH 曝險=0）。
+    把 σ 乘在全部庫存上，會憑空生出一筆不存在的價格風險。
+
+    正確做法：
+      inventory_usd       → 佔用資金，只算機會成本（opportunity_rate）
+      delta_exposure_usd  → 未對沖淨曝險，才算 σ√t 風險
+                            由上層從 sum(leg.delta.values()) 自動填入
+    """
+    inventory_usd:      float = 0.0   # 佔用資金（機會成本基數）
+    hold_time_hours:    float = 0.0
+    opportunity_rate:   float = 0.05  # 年化利率
+    sigma_daily:        float = 0.03  # 日波動率
+    delta_exposure_usd: float | None = None  # None=向後相容（用 inventory_usd）；0.0=delta-neutral（price_risk=0）
 
 
 @dataclass
@@ -361,12 +462,16 @@ def holding_cost(holding: HoldingParams) -> float:
     """
     資金持有成本 = 機會成本 + 價格風險調整項
 
-    opportunity = inventory × t_years × rate
+    opportunity = inventory_usd × t_years × rate
 
-    price_risk = inventory × σ_daily × √t_days
+    price_risk = delta_exposure_usd × σ_daily × √t_days
       ⚠️ 這是「風險調整項」，不是期望成本。
          隨機遊走的期望價格變動 = 0，price_risk 捕捉的是
          持有期間 1-sigma 的 mark-to-market 資金敞口風險。
+
+      Day 9 修正：改用 delta_exposure_usd 而非 inventory_usd：
+        - delta-neutral 策略（Boros 四腿）：delta_exposure_usd=0 → price_risk=0
+        - 一般 atomic arb：delta_exposure_usd = inventory_usd（預設向後相容）
 
     t_years 與 t_days 均由同一個 hold_time_hours 推導，確保一致：
       t_years = hold_time_hours / (365 × 24)
@@ -377,7 +482,15 @@ def holding_cost(holding: HoldingParams) -> float:
     t_years = holding.hold_time_hours / (365 * 24)
     t_days  = holding.hold_time_hours / 24
     opportunity = holding.inventory_usd * t_years * holding.opportunity_rate
-    price_risk  = holding.inventory_usd * holding.sigma_daily * math.sqrt(t_days)
+    # 使用 delta_exposure_usd：
+    #   None  → 向後相容，fallback 到 inventory_usd（一般 atomic arb）
+    #   0.0   → delta-neutral，price_risk = 0（Boros 四腿等 delta-neutral 策略）
+    #   > 0   → 指定未對沖淨曝險
+    if holding.delta_exposure_usd is None:
+        exposure = holding.inventory_usd
+    else:
+        exposure = holding.delta_exposure_usd
+    price_risk  = exposure * holding.sigma_daily * math.sqrt(t_days)
     return opportunity + price_risk
 
 
@@ -1242,3 +1355,728 @@ if __name__ == "__main__":
     )
     print(df_s.pivot(index="bribe_ratio", columns="k", values="ev").to_string())
     print("\n  → Day 8 前，bribe 掃描結果僅供定性參考")
+
+
+# ──────────────────────────────────────────────────────────────────
+# Day 9：通用腿實作 + 策略彙總 + Boros 驗收測試
+# ──────────────────────────────────────────────────────────────────
+
+class AmmSwapLeg:
+    """
+    把現有 AMM PoolState 包成 LegProtocol 介面。
+
+    amm_out / simulate_arb / optimal_size 全部不動，
+    所有現有測試繼續通過。
+    """
+    def __init__(self, pool: "PoolState", token_in: str, token_out: str,
+                 price_in_usd: float = 1.0, price_out_usd: float = 1.0):
+        self.pool         = pool
+        self.token_in     = token_in
+        self.token_out    = token_out
+        self.price_in_usd = price_in_usd
+        self.price_out_usd= price_out_usd
+
+    def evaluate(self, notional: float, horizon_hours: float = 0.0) -> "LegResult":
+        # notional = token_in 的量（token 單位）
+        dy, _, _ = amm_out(self.pool, notional)
+        return LegResult(
+            flows=[
+                CashFlow(self.token_in,  -notional, t_hours=0.0, kind="principal"),
+                CashFlow(self.token_out, +dy,       t_hours=0.0, kind="principal"),
+            ],
+            margins=[],
+            liquidations=[],     # swap 不鎖保證金，不存在清算
+            delta={
+                self.token_in:  -notional * self.price_in_usd,
+                self.token_out: +dy       * self.price_out_usd,
+            },
+            exit_ok=True,
+            atomic=True,
+            meta={"fee": self.pool.fee, "pool_x": self.pool.x, "pool_y": self.pool.y},
+        )
+
+
+@dataclass
+class PerpFundingLeg:
+    """
+    永續合約腿（收/付浮動資金費率）。
+
+    side         : "long"（付浮動，升水時付出）/ "short"（收浮動，升水時收入）
+    exchange     : 場所名稱（用於浮動對消驗算）
+    maker_fee    : 進場 maker 費率（e.g. 0.00015 = 0.015%）
+    taker_fee    : 進場 taker 費率（e.g. 0.00045 = 0.045%）
+    margin_asset : 保證金幣種
+    liq_threshold: 清算觸發價格（None = 未知）
+
+    ⚠️ atomic=False：非原子。進場後對手腿若未成交，
+       形成裸露曝險，需立即市價平倉（f_cost = 市場衝擊）。
+    """
+    side:          str    # "long" | "short"
+    exchange:      str
+    asset:         str    # 標的資產（e.g. "ETH"）
+    maker_fee:     float  = 0.0002   # 0.020% OKX default
+    taker_fee:     float  = 0.0005   # 0.050% OKX default
+    margin_asset:  str    = "USDT"
+    liq_threshold: float | None = None  # price
+
+    def evaluate(self, notional: float, horizon_hours: float) -> "LegResult":
+        # 浮動資金費：進場/出場時未知，以 floating=True 標記
+        # amount 設 0.0（待實際結算），counterparty=exchange 供對消驗算
+        direction = +1.0 if self.side == "short" else -1.0  # short 收浮動
+
+        maker_cost = notional * self.maker_fee
+        taker_cost = notional * self.taker_fee
+
+        liq_cond = LiquidationCondition(
+            driver="price",
+            direction="up"   if self.side == "short" else "down",
+            threshold=self.liq_threshold,
+            note=f"{self.side} ETH perp @{self.exchange}",
+        )
+
+        return LegResult(
+            flows=[
+                # 進場本金（佔用保證金，名目移動）
+                CashFlow(self.asset, -notional * (1 if self.side == "long" else -1),
+                         t_hours=0.0, kind="principal"),
+                # 浮動資金費（到期時結算，金額待定）
+                CashFlow("USD", direction * 0.0,
+                         t_hours=horizon_hours, kind="yield",
+                         floating=True, counterparty=self.exchange),
+                # 進場 maker 費用（負）
+                CashFlow("USD", -maker_cost, t_hours=0.0, kind="fee",
+                         meta_key="maker"),
+                # 進場 taker 費用（供 taker 路徑計算）
+                CashFlow("USD", -taker_cost, t_hours=0.0, kind="fee",
+                         meta_key="taker"),
+            ],
+            margins=[Margin(
+                asset=self.margin_asset,
+                amount=notional,   # 全額保證金（簡化，實際依槓桿而定）
+                venue=self.exchange,
+                cross_margined_with=[],
+            )],
+            delta={self.asset: direction * notional},  # short=-notional, long=+notional
+            liquidations=[liq_cond],
+            exit_ok=True,
+            atomic=False,
+            meta={"side": self.side, "exchange": self.exchange,
+                  "maker_fee": maker_cost, "taker_fee": taker_cost},
+        )
+
+
+@dataclass
+class BorosYULeg:
+    """
+    Boros YU 腿（收/付固定利率，押 ETH 保證金）。
+
+    side           : "short_yu"（SHORT YU = 收固定，付浮動）
+                   / "long_yu" （LONG  YU = 付固定，收浮動）
+    fixed_rate     : 年化固定利率（e.g. 0.0640 = 6.40%）
+    exchange       : YU 市場場所（"hyperliquid" or "okx"）
+    trade_fee_rate : 進場 trade fee（0.05% 依名目×到期時間）
+    settle_fee_rate: 結算費年化（0.2%，依名目）
+
+    ⚠️ settlement_fee_basis = "NOTIONAL_ANNUAL_PRORATED"
+       官方文件確認：position_size × 0.2% × period_years
+       每次結算（8h epoch@HL）扣一次，全期累計 = notional × 0.2% × days/365
+       只有 SHORT YU 腿收結算費（open interest fee）。
+
+    ⚠️ 保證金是 ETH，本身有價格波動風險（→ LiquidationCondition driver="implied_apr"）
+    """
+    side:            str    # "short_yu" | "long_yu"
+    fixed_rate:      float  # 年化（e.g. 0.0640）
+    exchange:        str    # "hyperliquid" | "okx"
+    trade_fee_rate:  float = 0.0005   # 0.05%
+    settle_fee_rate: float = 0.002    # 0.2% annual
+    margin_asset:    str   = "ETH"
+
+    def evaluate(self, notional: float, horizon_hours: float) -> "LegResult":
+        t_years = horizon_hours / (365 * 24)
+
+        # 固定利率現金流
+        sign = +1.0 if self.side == "short_yu" else -1.0   # short_yu 收固定
+        fixed_yield = notional * self.fixed_rate * t_years
+
+        # 浮動資金費（與 PerpFundingLeg 對消）
+        float_sign = -sign  # short_yu 付浮動
+
+        # Trade fee（依名目 × 到期時間，one-off at entry）
+        trade_fee = notional * self.trade_fee_rate * t_years
+
+        # Settlement fee（只有 short_yu 收，依名目 × 持有時間）
+        settle_fee = (notional * self.settle_fee_rate * t_years
+                      if self.side == "short_yu" else 0.0)
+
+        liq_cond = LiquidationCondition(
+            driver="implied_apr",
+            direction="up"   if self.side == "short_yu" else "down",
+            threshold=None,
+            note=f"Boros YU {self.side} @{self.exchange}: implied_apr 反向觸發清算",
+        )
+
+        return LegResult(
+            flows=[
+                # 固定利率收入（到期）
+                CashFlow("USD", sign * fixed_yield,
+                         t_hours=horizon_hours, kind="yield", floating=False),
+                # 浮動資金費（待結算，對消用）
+                CashFlow("USD", 0.0,
+                         t_hours=horizon_hours, kind="yield",
+                         floating=True, counterparty=self.exchange),
+                # Trade fee（進場時，負）
+                CashFlow("USD", -trade_fee, t_hours=0.0, kind="fee"),
+                # Settlement fee（持倉期間，負）
+                CashFlow("USD", -settle_fee, t_hours=horizon_hours / 2, kind="fee"),
+            ],
+            margins=[Margin(
+                asset=self.margin_asset,
+                amount=notional * 0.01,   # 約 1% ETH 保證金（簡化）
+                venue=f"boros_{self.exchange}",
+            )],
+            delta={"ETH": 0.0},  # YU 是利率商品，delta=0
+            liquidations=[liq_cond],
+            exit_ok=False,  # 需確認訂單簿深度（官方限單筆 ≤ 深度 0.2%）
+            exit_note="exit depth must be checked; Boros recommends ≤0.2% of OB depth per trade",
+            atomic=False,
+            meta={
+                "fixed_rate": self.fixed_rate,
+                "fixed_yield": sign * fixed_yield,
+                "trade_fee": trade_fee,
+                "settle_fee": settle_fee,
+                "settle_fee_basis": "NOTIONAL_ANNUAL_PRORATED",
+                "settlement_note": "0.2%/yr × notional × days/365，僅 short_yu 腿收取",
+            },
+        )
+
+
+def evaluate_strategy(legs: list, notional: float, horizon_hours: float,
+                       capital_usd: float, opportunity_rate: float = 0.05
+                       ) -> dict:
+    """
+    彙總多腿策略的現金流、delta、清算條件，算出淨 EV。
+
+    回傳：
+      delta_net       : 各資產淨 delta（應接近 0 for delta-neutral）
+      floating_check  : 浮動現金流是否對消（True = 驗算通過）
+      gross_yield_usd : 固定利率毛利
+      total_fee_usd   : 所有費用合計（maker 路徑）
+      total_fee_taker : 所有費用合計（taker 路徑）
+      opp_cost_usd    : 機會成本（capital × rate × t_years）
+      net_pnl_maker   : 淨利（maker 路徑）
+      net_pnl_taker   : 淨利（taker 路徑）
+      apr_maker        : 年化 APR（maker，on capital）
+      apr_taker        : 年化 APR（taker，on capital）
+      liquidation_count: 清算條件總數
+      results          : 每腿的 LegResult 列表
+    """
+    results = [leg.evaluate(notional, horizon_hours) for leg in legs]
+
+    # 1. delta 加總
+    delta_net: dict[str, float] = {}
+    for r in results:
+        for asset, val in r.delta.items():
+            delta_net[asset] = delta_net.get(asset, 0.0) + val
+
+    # 2. 浮動對消驗算
+    float_flows = [f for r in results for f in r.flows if f.floating]
+    cp_groups: dict[str, float] = {}
+    for f in float_flows:
+        cp_groups[f.counterparty] = cp_groups.get(f.counterparty, 0.0) + f.amount
+    floating_check = all(abs(v) < 1e-9 for v in cp_groups.values())
+
+    # 3. 現金流分析
+    gross_yield_usd  = sum(f.amount for r in results for f in r.flows
+                           if f.kind == "yield" and not f.floating and f.amount > 0)
+    gross_cost_usd   = sum(f.amount for r in results for f in r.flows
+                           if f.kind == "yield" and not f.floating and f.amount < 0)
+    # fee：maker = meta_key=="maker" 或無 meta_key；taker = meta_key=="taker"
+    def fee_amount(r_list, path: str) -> float:
+        total = 0.0
+        for r in r_list:
+            for f in r.flows:
+                if f.kind == "fee":
+                    mk = getattr(f, "meta_key", None)
+                    if path == "maker" and mk != "taker":
+                        total += f.amount
+                    elif path == "taker" and mk != "maker":
+                        total += f.amount
+        return total  # 負數
+
+    fee_maker = fee_amount(results, "maker")
+    fee_taker = fee_amount(results, "taker")
+
+    # 4. 機會成本
+    t_years   = horizon_hours / (365 * 24)
+    opp_cost  = capital_usd * t_years * opportunity_rate  # 正數（成本）
+
+    # 5. 淨利
+    net_maker = gross_yield_usd + gross_cost_usd + fee_maker - opp_cost
+    net_taker = gross_yield_usd + gross_cost_usd + fee_taker - opp_cost
+
+    apr_maker = net_maker / capital_usd / t_years if capital_usd > 0 else 0.0
+    apr_taker = net_taker / capital_usd / t_years if capital_usd > 0 else 0.0
+
+    liq_count = sum(len(r.liquidations) for r in results)
+
+    return {
+        "delta_net":         delta_net,
+        "floating_check":    floating_check,
+        "gross_yield_usd":   gross_yield_usd,
+        "gross_cost_usd":    gross_cost_usd,
+        "total_fee_maker":   fee_maker,
+        "total_fee_taker":   fee_taker,
+        "opp_cost_usd":      opp_cost,
+        "net_pnl_maker":     net_maker,
+        "net_pnl_taker":     net_taker,
+        "apr_maker":         apr_maker,
+        "apr_taker":         apr_taker,
+        "liquidation_count": liq_count,
+        "results":           results,
+    }
+
+
+def test_boros_four_leg():
+    """
+    Boros 四腿驗收測試（2026-08-17 快照）。
+    來源：x.com/pendle_fi/status/2089621442807869484（self-reported）
+
+    期望值（from Roy's spec + Pendle position page）：
+
+    | 檢查項              | 期望值      |
+    |---------------------|-------------|
+    | sum(delta.values()) | ≈ 0         |
+    | 浮動現金流加總       | ≈ 0         |
+    | 毛利（到期）         | ~$10,246   |
+    | 費用（maker路徑）    | ~-$1,542   |
+    | 費用（taker路徑）    | ~-$3,432   |
+    | 機會成本             | ~$1,099    |
+    | 淨利 maker           | ~$7,605    |
+    | 淨利 taker           | ~$5,715    |
+    | APR maker            | ~35.5%     |
+    | 清算條件數量          | ≥ 4        |
+
+    ⚠️ 注意：
+    - settlement_fee 0.2%/yr 只收 SHORT YU 腿（single leg basis）
+    - 官方 perp entry fee $1,332 介於 maker/taker 之間
+    - Boros trade fee $210 ≈ single leg × 0.05% × TTM（TTM≈24d）
+    """
+    CAPITAL  = 288_621.0
+    NOTIONAL = 3_160_000.0     # 每腿名目（Boros YU / Perp 各 ~3.15-3.16M）
+    DAYS     = 27.8
+    HOURS    = DAYS * 24
+
+    # 4 條腿
+    leg1 = PerpFundingLeg(
+        side="short", exchange="hyperliquid", asset="ETH",
+        maker_fee=0.00015, taker_fee=0.00045,
+        margin_asset="USDT",
+    )
+    leg2 = PerpFundingLeg(
+        side="long", exchange="okx", asset="ETH",
+        maker_fee=0.0002, taker_fee=0.0005,
+        margin_asset="USDT",
+    )
+    leg3 = BorosYULeg(
+        side="short_yu", fixed_rate=0.0640,
+        exchange="hyperliquid",
+    )
+    leg4 = BorosYULeg(
+        side="long_yu", fixed_rate=0.0214,
+        exchange="okx",
+    )
+
+    result = evaluate_strategy(
+        legs=[leg1, leg2, leg3, leg4],
+        notional=NOTIONAL,
+        horizon_hours=HOURS,
+        capital_usd=CAPITAL,
+        opportunity_rate=0.05,
+    )
+
+    print("=" * 60)
+    print("  test_boros_four_leg")
+    print("=" * 60)
+    failures = []
+
+    # ① delta 中性
+    delta_sum = sum(result["delta_net"].values())
+    delta_ok  = abs(delta_sum) < 1.0   # $1 容差（名目 $3.16M）
+    status = "✅" if delta_ok else "❌"
+    print(f"  {status} delta_net sum = ${delta_sum:+.2f}  (期望 ≈ 0)")
+    if not delta_ok:
+        failures.append(f"delta_net = {delta_sum:.2f}（應≈0）")
+
+    # ② 浮動對消
+    float_ok = result["floating_check"]
+    status = "✅" if float_ok else "❌"
+    print(f"  {status} 浮動現金流對消 = {float_ok}")
+    if not float_ok:
+        failures.append("浮動現金流未對消")
+
+    # ③ 毛利
+    gross = result["gross_yield_usd"] + result["gross_cost_usd"]
+    gross_ok = abs(gross - 10_246) < 500
+    status = "✅" if gross_ok else "❌"
+    print(f"  {status} 毛利 = ${gross:,.0f}  (期望 ~$10,246)")
+    if not gross_ok:
+        failures.append(f"毛利 {gross:.0f}（期望 10246）")
+
+    # ④ 機會成本
+    opp = result["opp_cost_usd"]
+    opp_ok = abs(opp - 1_099) < 50
+    status = "✅" if opp_ok else "❌"
+    print(f"  {status} 機會成本 = ${opp:,.0f}  (期望 ~$1,099)")
+    if not opp_ok:
+        failures.append(f"機會成本 {opp:.0f}（期望 1099）")
+
+    # ⑤ 淨利 maker（參考）
+    net_m = result["net_pnl_maker"]
+    net_t = result["net_pnl_taker"]
+    print(f"  ℹ️  淨利 maker = ${net_m:,.0f}  taker = ${net_t:,.0f}")
+    print(f"  ℹ️  APR maker  = {result['apr_maker']:.1%}  taker = {result['apr_taker']:.1%}")
+
+    # ⑥ 清算條件 ≥ 4
+    liq = result["liquidation_count"]
+    liq_ok = liq >= 4
+    status = "✅" if liq_ok else "❌"
+    print(f"  {status} 清算條件數量 = {liq}  (期望 ≥ 4)")
+    if not liq_ok:
+        failures.append(f"清算條件 {liq}（期望≥4）")
+
+    # ⑦ 各腿費用明細
+    print()
+    print("  費用明細：")
+    for i, r in enumerate(result["results"]):
+        leg_fees = sum(f.amount for f in r.flows if f.kind == "fee")
+        leg_name = ["PerpShort@HL", "PerpLong@OKX", "BorosShort@HL", "BorosLong@OKX"][i]
+        print(f"    Leg{i+1} {leg_name}: ${leg_fees:,.0f}")
+
+    print()
+    if failures:
+        print(f"  ❌ FAIL: {len(failures)} 項")
+        for f in failures:
+            print(f"    - {f}")
+    else:
+        print("  ✅ PASS：全部通過")
+
+    assert not failures, f"test_boros_four_leg failed: {failures}"
+    return result
+
+
+# ──────────────────────────────────────────────────────────────────
+# Day 9：通用腿實作 + 策略彙總 + Boros 驗收測試
+# ──────────────────────────────────────────────────────────────────
+
+class AmmSwapLeg:
+    """
+    把現有 AMM PoolState 包成 LegProtocol 介面。
+
+    amm_out / simulate_arb / optimal_size 全部不動，
+    所有現有測試繼續通過。
+    """
+    def __init__(self, pool, token_in: str, token_out: str,
+                 price_in_usd: float = 1.0, price_out_usd: float = 1.0):
+        self.pool          = pool
+        self.token_in      = token_in
+        self.token_out     = token_out
+        self.price_in_usd  = price_in_usd
+        self.price_out_usd = price_out_usd
+
+    def evaluate(self, notional: float, horizon_hours: float = 0.0) -> "LegResult":
+        dy, _, _ = amm_out(self.pool, notional)
+        return LegResult(
+            flows=[
+                CashFlow(self.token_in,  -notional, t_hours=0.0, kind="principal"),
+                CashFlow(self.token_out, +dy,        t_hours=0.0, kind="principal"),
+            ],
+            margins=[],
+            liquidations=[],
+            delta={
+                self.token_in:  -notional * self.price_in_usd,
+                self.token_out: +dy       * self.price_out_usd,
+            },
+            exit_ok=True,
+            atomic=True,
+            meta={"fee": self.pool.fee, "pool_x": self.pool.x, "pool_y": self.pool.y},
+        )
+
+
+class PerpFundingLeg:
+    """
+    永續合約腿（收/付浮動資金費率）。
+
+    side     : "long"（付浮動）/ "short"（收浮動）
+    exchange : 場所名稱（用於浮動對消驗算）
+    atomic=False：非原子，對手腿未成交則形成裸露曝險。
+    """
+    def __init__(self, side: str, exchange: str, asset: str = "ETH",
+                 maker_fee: float = 0.0002, taker_fee: float = 0.0005,
+                 margin_asset: str = "USDT", liq_threshold=None):
+        self.side          = side
+        self.exchange      = exchange
+        self.asset         = asset
+        self.maker_fee     = maker_fee
+        self.taker_fee     = taker_fee
+        self.margin_asset  = margin_asset
+        self.liq_threshold = liq_threshold
+
+    def evaluate(self, notional: float, horizon_hours: float) -> "LegResult":
+        direction = +1.0 if self.side == "short" else -1.0
+        maker_cost = notional * self.maker_fee
+        taker_cost = notional * self.taker_fee
+
+        liq_cond = LiquidationCondition(
+            driver="price",
+            direction="up"  if self.side == "short" else "down",
+            threshold=self.liq_threshold,
+            note=f"{self.side} ETH perp @{self.exchange}",
+        )
+
+        f_maker = CashFlow("USD", -maker_cost, t_hours=0.0, kind="fee")
+        f_maker.meta_key = "maker"
+        f_taker = CashFlow("USD", -taker_cost, t_hours=0.0, kind="fee")
+        f_taker.meta_key = "taker"
+
+        return LegResult(
+            flows=[
+                CashFlow(self.asset, direction * notional, t_hours=0.0, kind="principal"),
+                CashFlow("USD", 0.0, t_hours=horizon_hours, kind="yield",
+                         floating=True, counterparty=self.exchange),
+                f_maker,
+                f_taker,
+            ],
+            margins=[Margin(asset=self.margin_asset, amount=notional,
+                            venue=self.exchange)],
+            delta={self.asset: direction * notional},
+            liquidations=[liq_cond],
+            exit_ok=True,
+            atomic=False,
+            meta={"side": self.side, "exchange": self.exchange,
+                  "maker_fee_usd": maker_cost, "taker_fee_usd": taker_cost},
+        )
+
+
+class BorosYULeg:
+    """
+    Boros YU 腿（收/付固定利率 + 浮動對消）。
+
+    side           : "short_yu"（收固定 6.40%，付浮動）
+                   / "long_yu" （付固定 2.14%，收浮動）
+    fixed_rate     : 年化固定利率
+    settle_fee_rate: 0.2%/yr on notional，只有 short_yu 腿收取
+                     （官方文件確認：Settlement Fee = position_size × rate × period_years）
+    """
+    def __init__(self, side: str, fixed_rate: float, exchange: str,
+                 trade_fee_rate: float = 0.0005, settle_fee_rate: float = 0.002,
+                 margin_asset: str = "ETH"):
+        self.side            = side
+        self.fixed_rate      = fixed_rate
+        self.exchange        = exchange
+        self.trade_fee_rate  = trade_fee_rate
+        self.settle_fee_rate = settle_fee_rate
+        self.margin_asset    = margin_asset
+
+    def evaluate(self, notional: float, horizon_hours: float) -> "LegResult":
+        t_years     = horizon_hours / (365 * 24)
+        sign        = +1.0 if self.side == "short_yu" else -1.0
+        fixed_yield = notional * self.fixed_rate * t_years
+        trade_fee   = notional * self.trade_fee_rate * t_years
+        settle_fee  = (notional * self.settle_fee_rate * t_years
+                       if self.side == "short_yu" else 0.0)
+
+        f_trade = CashFlow("USD", -trade_fee, t_hours=0.0, kind="fee")
+        f_trade.meta_key = "maker"
+        f_settle = CashFlow("USD", -settle_fee, t_hours=horizon_hours / 2, kind="fee")
+        f_settle.meta_key = "maker"
+
+        liq_cond = LiquidationCondition(
+            driver="implied_apr",
+            direction="up"  if self.side == "short_yu" else "down",
+            threshold=None,
+            note=f"Boros YU {self.side} @{self.exchange}",
+        )
+
+        return LegResult(
+            flows=[
+                CashFlow("USD", sign * fixed_yield, t_hours=horizon_hours,
+                         kind="yield", floating=False),
+                CashFlow("USD", 0.0, t_hours=horizon_hours, kind="yield",
+                         floating=True, counterparty=self.exchange),
+                f_trade,
+                f_settle,
+            ],
+            margins=[Margin(asset=self.margin_asset,
+                            amount=notional * 0.01,
+                            venue=f"boros_{self.exchange}")],
+            delta={"ETH": 0.0},
+            liquidations=[liq_cond],
+            exit_ok=False,
+            exit_note="exit depth must be checked; Boros recommends <=0.2% of OB depth per trade",
+            atomic=False,
+            meta={
+                "fixed_rate": self.fixed_rate,
+                "fixed_yield_usd": sign * fixed_yield,
+                "trade_fee_usd": trade_fee,
+                "settle_fee_usd": settle_fee,
+                "settle_fee_basis": "NOTIONAL_ANNUAL_PRORATED",
+            },
+        )
+
+
+def evaluate_strategy(legs: list, notional: float, horizon_hours: float,
+                       capital_usd: float, opportunity_rate: float = 0.05) -> dict:
+    """
+    彙總多腿策略的現金流、delta、清算條件，算出淨 EV。
+    """
+    results = [leg.evaluate(notional, horizon_hours) for leg in legs]
+
+    # 1. delta 加總
+    delta_net: dict = {}
+    for r in results:
+        for asset, val in r.delta.items():
+            delta_net[asset] = delta_net.get(asset, 0.0) + val
+
+    # 2. 浮動對消驗算
+    float_flows = [f for r in results for f in r.flows if f.floating]
+    cp_groups: dict = {}
+    for f in float_flows:
+        cp_groups[f.counterparty] = cp_groups.get(f.counterparty, 0.0) + f.amount
+    floating_check = all(abs(v) < 1e-9 for v in cp_groups.values())
+
+    # 3. 現金流分析
+    gross_yield = sum(f.amount for r in results for f in r.flows
+                      if f.kind == "yield" and not f.floating and f.amount > 0)
+    gross_cost  = sum(f.amount for r in results for f in r.flows
+                      if f.kind == "yield" and not f.floating and f.amount < 0)
+
+    def fee_sum(path: str) -> float:
+        total = 0.0
+        for r in results:
+            for f in r.flows:
+                if f.kind == "fee":
+                    mk = getattr(f, "meta_key", "maker")
+                    if path == "maker" and mk != "taker":
+                        total += f.amount
+                    elif path == "taker" and mk != "maker":
+                        total += f.amount
+        return total
+
+    fee_maker = fee_sum("maker")
+    fee_taker = fee_sum("taker")
+
+    # 4. 機會成本
+    t_years  = horizon_hours / (365 * 24)
+    opp_cost = capital_usd * t_years * opportunity_rate
+
+    # 5. 淨利
+    net_maker = gross_yield + gross_cost + fee_maker - opp_cost
+    net_taker = gross_yield + gross_cost + fee_taker - opp_cost
+    apr_maker = net_maker / capital_usd / t_years if capital_usd > 0 else 0.0
+    apr_taker = net_taker / capital_usd / t_years if capital_usd > 0 else 0.0
+
+    return {
+        "delta_net":         delta_net,
+        "floating_check":    floating_check,
+        "gross_yield_usd":   gross_yield,
+        "gross_cost_usd":    gross_cost,
+        "total_fee_maker":   fee_maker,
+        "total_fee_taker":   fee_taker,
+        "opp_cost_usd":      opp_cost,
+        "net_pnl_maker":     net_maker,
+        "net_pnl_taker":     net_taker,
+        "apr_maker":         apr_maker,
+        "apr_taker":         apr_taker,
+        "liquidation_count": sum(len(r.liquidations) for r in results),
+        "results":           results,
+    }
+
+
+def test_boros_four_leg():
+    """
+    Boros 四腿驗收測試（2026-08-17 快照）。
+    來源：x.com/pendle_fi/status/2089621442807869484
+
+    官方 PnL 瀑布（position page）：
+      Gross spread:    +$10,246
+      Perp entry fees:  -$1,332  （介於 maker/taker，本測試分開計算）
+      Entry slippage:     -$423  （本模型不建模，計入 meta）
+      Boros trade fee:    -$210
+      Settlement fee:     -$481  （只算 short_yu 腿）
+      Net PnL:          +$7,800
+
+    ⚠️ settlement_fee 確認：0.2%/yr on position_size（名目），
+       官方文件 docs.pendle.finance/boros-docs/boros-systems/fees，
+       只有 short_yu（open interest 方）收取。
+       3,160,000 × 0.002 × 27.8/365 = $481 ← 吻合。
+    """
+    CAPITAL  = 288_621.0
+    NOTIONAL = 3_160_000.0
+    DAYS     = 27.8
+    HOURS    = DAYS * 24
+
+    leg1 = PerpFundingLeg("short", "hyperliquid", maker_fee=0.00015, taker_fee=0.00045)
+    leg2 = PerpFundingLeg("long",  "okx",         maker_fee=0.0002,  taker_fee=0.0005)
+    leg3 = BorosYULeg("short_yu", fixed_rate=0.0640, exchange="hyperliquid")
+    leg4 = BorosYULeg("long_yu",  fixed_rate=0.0214, exchange="okx")
+
+    res = evaluate_strategy([leg1, leg2, leg3, leg4], NOTIONAL, HOURS,
+                             CAPITAL, opportunity_rate=0.05)
+
+    failures = []
+    print("=" * 60)
+    print("  test_boros_four_leg")
+    print("=" * 60)
+
+    # ① delta 中性
+    delta_sum = sum(res["delta_net"].values())
+    ok = abs(delta_sum) < 1.0
+    print(f"  {'✅' if ok else '❌'} delta_net sum = ${delta_sum:+,.0f}  (期望 ≈ 0)")
+    if not ok: failures.append(f"delta_net={delta_sum:.2f}")
+
+    # ② 浮動對消
+    ok = res["floating_check"]
+    print(f"  {'✅' if ok else '❌'} 浮動現金流對消 = {ok}")
+    if not ok: failures.append("浮動未對消")
+
+    # ③ 毛利（gross_yield - |gross_cost|）
+    gross = res["gross_yield_usd"] + res["gross_cost_usd"]
+    ok = abs(gross - 10_246) < 600
+    print(f"  {'✅' if ok else '❌'} 毛利 = ${gross:,.0f}  (期望 ~$10,246)")
+    if not ok: failures.append(f"毛利={gross:.0f}")
+
+    # ④ 機會成本
+    opp = res["opp_cost_usd"]
+    ok  = abs(opp - 1_099) < 50
+    print(f"  {'✅' if ok else '❌'} 機會成本 = ${opp:,.0f}  (期望 ~$1,099)")
+    if not ok: failures.append(f"機會成本={opp:.0f}")
+
+    # ⑤ 淨利參考
+    print(f"  ℹ️  淨利 maker = ${res['net_pnl_maker']:,.0f}  "
+          f"taker = ${res['net_pnl_taker']:,.0f}")
+    print(f"  ℹ️  APR  maker = {res['apr_maker']:.1%}  "
+          f"taker = {res['apr_taker']:.1%}")
+
+    # ⑥ 清算條件 ≥ 4
+    liq = res["liquidation_count"]
+    ok  = liq >= 4
+    print(f"  {'✅' if ok else '❌'} 清算條件數量 = {liq}  (期望 ≥ 4)")
+    if not ok: failures.append(f"liq_count={liq}")
+
+    # ⑦ 費用明細
+    print()
+    print("  費用明細（per leg）：")
+    labels = ["PerpShort@HL", "PerpLong@OKX", "BorosShort@HL", "BorosLong@OKX"]
+    for i, (r, lbl) in enumerate(zip(res["results"], labels)):
+        fees = sum(f.amount for f in r.flows if f.kind == "fee"
+                   and getattr(f, "meta_key", "maker") != "taker")
+        print(f"    Leg{i+1} {lbl}: ${fees:,.0f}")
+
+    print()
+    if failures:
+        print(f"  ❌ FAIL ({len(failures)} 項): {failures}")
+    else:
+        print("  ✅ PASS：全部通過")
+
+    assert not failures, f"test_boros_four_leg FAILED: {failures}"
+    return res
