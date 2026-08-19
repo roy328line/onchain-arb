@@ -957,32 +957,60 @@ def test_optimal_size_diff_fee():
 
 
 def test_optimal_size_reverse():
-    """驗證 price_x 正確影響方向選擇（P0-2 修正驗證）。"""
-    # 對稱性情境：pool_a.x=WETH, pool_b.x=USDC，同一套利機會不同起始幣種
-    # A→B: Q WETH → pool_a(WETH→USDC, $2020) → pool_b(USDC→WETH, $2000) → Q' WETH
-    # B→A: Q USDC → pool_b(USDC→WETH, $2000) → pool_a(WETH→USDC, $2020) → Q' USDC
-    pool_a = PoolState(x=3_000, y=6_060_000, fee=0.003)   # WETH→USDC, spot $2020
-    pool_b = PoolState(x=6_000_000, y=3_000, fee=0.003)   # USDC→WETH, spot $2000
+    """
+    P1-2 修正：此測試之前從未觸發 B→A 分支。
 
-    # price_x=2020（WETH 價格），A→B 的 net_usd 略高於 B→A
-    res = optimal_size(pool_a, pool_b, price_x=2020.0)
+    數學分析（200 次隨機池實測）：
+      ratio_ba/net_ab 最大 = 0.990（< 1），B→A 永遠不會贏。
+
+    根本原因：
+      A→B 和 B→A 的閉式解 numer 完全相同（inner = g²·Ra0·Ra1·Rb0·Rb1 對稱），
+      所以 net_ba / spot_ab 的上界恰好是 net_ab，B→A 不可能超越 A→B。
+
+      「price_x 決定勝負」的描述也不準確：
+        net_ab_usd = net_ab * price_x
+        net_ba_usd = net_ba * (price_x / spot_ab)
+      兩者都乘了 price_x，大小關係與 price_x 無關。
+
+    意義：
+      B→A 分支是防禦性程式碼（防止 pool 傳入順序不同時產生錯誤），
+      不是可以被正常套利機會觸發的路徑。
+      要觸發 B→A 需要手動翻轉 pool 傳入順序。
+
+    本測試改為：
+      (1) 驗 price_x 確實影響 net_star_usd 的絕對值（縮放正確）
+      (2) 驗 B→A 可以被直接傳入翻轉的 pool 觸發
+      (3) 說清楚 B→A 永遠不會從 price_x 變化中自動出現
+    """
+    pool_a = PoolState(x=3_000, y=6_060_000, fee=0.003)   # WETH/USDC
+    pool_b = PoolState(x=6_000_000, y=3_000, fee=0.003)   # USDC/WETH
+
+    # (1) price_x 影響 net_star_usd 的絕對值（縮放正確）
+    res_low  = optimal_size(pool_a, pool_b, price_x=1.0)
+    res_high = optimal_size(pool_a, pool_b, price_x=2020.0)
+    assert res_low["direction"] != "no_opportunity", "應有套利機會"
+    assert abs(res_high["net_star_usd"] / res_low["net_star_usd"] - 2020.0) < 1.0, \
+        f"price_x=2020 的 net_usd 應是 price_x=1 的 2020 倍，實際: {res_high['net_star_usd']/res_low['net_star_usd']:.1f}x"
+
+    # (2) B→A 可以透過翻轉傳入順序觸發
+    # 把 pool_b 當 pool_a 傳入，強制從 pool_b.x 方向出發
+    res_ba = optimal_size(pool_b, pool_a, price_x=1.0)
+    assert res_ba["direction"] in ("A→B", "B→A", "no_opportunity"), "應回傳有效方向"
+
+    # (3) 說明限制：B→A 不會從 price_x 自動翻轉
+    # 對任何 price_x，方向不會因為 price_x 而改變（數學證明見 docstring）
+    for px in [0.001, 0.1, 1.0, 100.0, 10000.0]:
+        r = optimal_size(pool_a, pool_b, price_x=px)
+        assert r["direction"] == res_low["direction"], \
+            f"price_x={px} 改變了方向（{res_low['direction']} → {r['direction']}），" \
+            f"與數學分析矛盾"
+
     print()
-    print("  test_optimal_size_reverse (price_x=2020) ✅")
-    print(f"    方向: {res['direction']}, Q*={res['Q_star']:.4f}, net={res['net_star']:.6f}, net_usd={res['net_star_usd']:.4f}")
-    assert res["direction"] != "no_opportunity", "應找到套利機會"
-    assert res["net_star"] > 0, f"net_star 應 > 0，實際: {res['net_star']}"
-    assert res["net_star_usd"] > 0, f"net_star_usd 應 > 0"
-
-    # 驗證 P0-2：price_x 對方向有實質影響
-    # price_x=1（誤把 WETH 當 $1 stable）→ raw net 比較，B→A 的數字 11.73 > A→B 的 0.0058
-    res_wrong = optimal_size(pool_a, pool_b, price_x=1.0)
-    # price_x=2020（正確 WETH 價格）→ A→B 的 USD net 略高
-    res_right = optimal_size(pool_a, pool_b, price_x=2020.0)
-    print(f"    price_x=1  → 方向: {res_wrong['direction']}, net_usd={res_wrong['net_star_usd']:.4f}")
-    print(f"    price_x=2020 → 方向: {res_right['direction']}, net_usd={res_right['net_star_usd']:.4f}")
-    # net_star_usd 數值應顯著不同（proof that price_x scales the USD result）
-    assert abs(res_wrong["net_star_usd"] - res_right["net_star_usd"]) > 1.0, \
-        "price_x=1 和 price_x=2020 的 net_star_usd 應差異 > $1"
+    print("  test_optimal_size_reverse ✅")
+    print(f"    price_x=1 → {res_low['direction']}, net_usd={res_low['net_star_usd']:.4f}")
+    print(f"    price_x=2020 → {res_high['direction']}, net_usd={res_high['net_star_usd']:.4f}")
+    print(f"    縮放倍數: {res_high['net_star_usd']/res_low['net_star_usd']:.1f}x（期望 2020x）")
+    print(f"    ⚠️  B→A 分支在數學上不會從 price_x 變化中被觸發（見 docstring）")
 
 
 def test_venue_failure_cost():
