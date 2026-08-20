@@ -77,7 +77,35 @@ KEY       = os.environ.get("TYCHO_API_KEY", "")
 TYCHO_URL = "tycho-fynd-ethereum.propellerheads.xyz:443"
 BINARY    = Path(__file__).parent / "tycho-client"
 
-GAS_COST     = 5.5   # $5.5 per tx（三腿比兩腿 gas 略高，之後可調整）
+GAS_COST_STATIC = 5.5   # 備用靜態值（寫死 $5.5，僅當 RPC 失敗時使用）
+
+def _get_dynamic_gas_cost() -> float:
+    """
+    從 public RPC 取得 real-time basefee，計算三角套利的動態 gas_cost_usd。
+    Day 15 發現：Dencun 後 basefee ≈ 0.05-0.1 gwei，gas_cost ≈ $0.08（非 $5.5）。
+    失敗時 fallback 到 GAS_COST_STATIC。
+    """
+    try:
+        import urllib.request as _ur
+        body = json.dumps({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "eth_getBlockByNumber",
+            "params": ["latest", False]
+        }).encode()
+        req  = _ur.Request("https://ethereum.publicnode.com", data=body,
+                           headers={"Content-Type": "application/json",
+                                    "User-Agent": "curl/7.88.1"})
+        resp = json.loads(_ur.urlopen(req, timeout=5).read())
+        basefee_gwei = int(resp["result"]["baseFeePerGas"], 16) / 1e9
+        priority_gwei = 0.1
+        total_gwei = basefee_gwei + priority_gwei
+        eth_price  = 2500.0  # 靜態估算，後續可接 oracle
+        gas_units  = 210_000  # 三腿 swap 估算
+        return round(total_gwei * gas_units * eth_price * 1e-9, 4)
+    except Exception:
+        return GAS_COST_STATIC
+
+GAS_COST = _get_dynamic_gas_cost()
 # Day 9：三角掃描器也切換到 bundle venue（f_cost=0）
 # 統一與 tycho_scanner 的 venue 設定
 CHAIN_BUNDLE = ChainParams(venue="bundle", base_gas_usd=4.0, priority_fee_usd=1.5)
