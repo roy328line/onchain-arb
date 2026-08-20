@@ -1440,33 +1440,35 @@ class BorosYULeg:
                    / "long_yu" （付固定，收浮動）
     fixed_rate     : 年化固定利率（e.g. 0.0640 = 6.40%）
 
-    trade_fee_rate : 0.05%，成交時一次性收取（全額 notional × rate）
-                     ⚠️ 不按時間比例化！原版錯誤地乘了 t_years（低估 13.1×）
+    trade_fee_rate : 0.05% Taker Fee，**按 notional × rate × TTM_years** 計算。
+                     官方文件確認（docs.pendle.finance/boros-docs/boros-systems/fees）：
+                     "The fee scales with position size and time to maturity"
+                     "at a 0.05% fee rate, opening a position 90 days before maturity
+                      costs roughly 0.012% of notional (0.05% × 90/365)"
+                     ⚠️ 這與 perp 進場費（全額一次性）不同，不可混用。
+                     Maker order（掛限價單）免費，Taker（市價單）才收。
 
-    settle_fee_rate: 0.2%，但基數尚未確認（UNKNOWN）
-      - 解讀 A (ANNUAL_PRORATED)：notional × 0.2% × days/365（年化比例）
-        → $481 for $3.16M × 27.8d（與 Pendle position page 吻合）
-      - 解讀 B (FLAT)：每次結算收 0.2% × notional（平費，非年化）
-        → $12,640 for $3.16M（讓整筆交易大幅虧損）
-      在確認前，模型對兩種假設各算一次。
-
-    ⚠️ settlement_fee_basis = "UNKNOWN"
-       去 docs.pendle.finance/boros-docs 或 Discord 確認後才能選邊。
+    settle_fee_rate: 0.2% Settlement Fee（Open Interest Fee）
+                     官方文件確認：ANNUAL_PRORATED
+                     公式：Settlement Fee = Position Size × 0.2%/yr × period_years
+                     每 8 小時結算一次（HL 市場），全期累積 = notional × 0.2% × days/365
+                     兩腿（SHORT YU + LONG YU）**都付**，不分方向。
+                     ✅ settle_fee_basis = "CONFIRMED_ANNUAL_PRORATED"
     """
 
-    SETTLEMENT_FEE_BASIS = "UNKNOWN"  # 修改此值後請同步更新 docstring
+    SETTLEMENT_FEE_BASIS = "CONFIRMED_ANNUAL_PRORATED"
 
     def __init__(self, side: str, fixed_rate: float, exchange: str,
                  trade_fee_rate: float = 0.0005,
                  settle_fee_rate: float = 0.002,
-                 settle_basis: str = "ANNUAL_PRORATED",  # or "FLAT"
+                 settle_basis: str = "ANNUAL_PRORATED",
                  margin_asset: str = "ETH"):
         self.side            = side
         self.fixed_rate      = fixed_rate
         self.exchange        = exchange
         self.trade_fee_rate  = trade_fee_rate
         self.settle_fee_rate = settle_fee_rate
-        self.settle_basis    = settle_basis   # 傳入選哪種解讀
+        self.settle_basis    = settle_basis
         self.margin_asset    = margin_asset
 
     def evaluate(self, notional: float, horizon_hours: float) -> "LegResult":
@@ -1475,20 +1477,20 @@ class BorosYULeg:
 
         fixed_yield = notional * self.fixed_rate * t_years
 
-        # P0-3 修正：trade_fee 是成交時收一次，不乘 t_years
-        trade_fee = notional * self.trade_fee_rate   # 全額，非年化
+        # Taker Fee：按 notional × rate × TTM_years（官方文件確認）
+        # TTM ≈ horizon_hours（進場時距到期的時間）
+        # Maker order 免費，這裡假設 taker 路徑
+        trade_fee = notional * self.trade_fee_rate * t_years
 
-        # P0-4：settle_fee 依 settle_basis 計算，basis = UNKNOWN
+        # Settlement Fee：CONFIRMED ANNUAL_PRORATED
+        # 官方：Position Size × 0.2%/yr × period_years，兩腿都付
         if self.settle_basis == "ANNUAL_PRORATED":
-            # 解讀 A：年化，按持倉時間比例
-            settle_fee = (notional * self.settle_fee_rate * t_years
-                          if self.side == "short_yu" else 0.0)
+            settle_fee = notional * self.settle_fee_rate * t_years  # 兩腿都付
         elif self.settle_basis == "FLAT":
-            # 解讀 B：每次結算收 0.2% 名目（非年化）
-            # 兩腿都付（short_yu + long_yu 各一次）
+            # 備用：舊的錯誤解讀，供對比用
             settle_fee = notional * self.settle_fee_rate
         else:
-            settle_fee = 0.0  # UNKNOWN：先不收，讓呼叫方自行處理
+            settle_fee = 0.0
 
         f_trade = CashFlow("USD", -trade_fee, t_hours=0.0, kind="fee")
         f_trade.meta_key = "maker"
@@ -1733,7 +1735,7 @@ def test_boros_four_leg():
     print("  test_boros_four_leg")
     print("=" * 62)
     print(f"  NOTIONAL = ${NOTIONAL:,.0f}  CAPITAL = ${CAPITAL:,.0f}")
-    print(f"  DAYS = {DAYS}  settlement_fee_basis = UNKNOWN")
+    print(f"  DAYS = {DAYS}  settlement_fee_basis = CONFIRMED_ANNUAL_PRORATED")
     print()
 
     all_pass = True
@@ -1793,9 +1795,9 @@ def test_boros_four_leg():
             print(f"  ✅ {basis} PASS")
         print()
 
-    print("  ⚠️  settle_fee_basis = UNKNOWN")
-    print("  ⚠️  請至 docs.pendle.finance/boros-docs 或 Discord 確認後再選邊。")
-    print("  ⚠️  兩種假設的 APR 差距很大，確認前不要依賴任何一個數字。")
+    print("  ✅ settle_fee_basis = CONFIRMED_ANNUAL_PRORATED")
+    print("  ✅ 官方文件：Position Size × 0.2%/yr × period_years，兩腿都付")
+    print("  ℹ️  FLAT 假設（舊的錯誤解讀）供對比：APR -21.7%")
     if all_pass:
         print("  ✅ 全假設通過")
     else:
