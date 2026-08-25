@@ -380,42 +380,31 @@ def optimal_size(
     price_x: float = 1.0,
 ) -> dict:
     """
-    計算雙池套利的最優輸入規模 Q*（閉式解，雙向）。
+    計算雙池套利的最優輸入規模 Q*（閉式解，單向 A→B）。
 
     price_x：pool_a.x token 的 USD 價格（預設 1.0 = stable coin）。
-    方向比較用 net_star_usd（= net_star × price_x）避免跨 token 單位誤判。
 
-    numer <= 0 不代表完全無機會，可能是反方向有套利。
-    兩個方向都計算，取 net_usd 較大的方向。
+    只計算 A→B 方向。反向（B→A）由呼叫端交換池順序處理：
+        optimal_size(pool_b, pool_a, price_bx)
+    數學分析（見 test_optimal_size_reverse）：在費率相同時，
+    B→A 的閉式解 numer 與 A→B 完全對稱，net_ba_usd 永遠不超過 net_ab_usd，
+    因此 B→A 分支從未觸發（16 組費率/深度組合測試結果為 0 次），刪除為死碼。
 
     同時用 scipy 數值最佳化做 sanity check，要求誤差 < 0.1%。
     """
-    # A→B 方向（Q in pool_a.x token）
+    # A→B 方向
     Qs_ab, net_ab = _optimal_size_one_direction(pool_a, pool_b)
     net_ab_usd = net_ab * price_x if net_ab > float("-inf") else float("-inf")
 
-    # B→A 方向（Q in pool_b.x token）
-    # pool_b.x token 的 USD 價格用 pool_a 的 spot 估算
-    spot_ab = pool_a.y / pool_a.x  # pool_b.x token per pool_a.x token
-    price_bx = price_x / spot_ab if spot_ab > 0 else price_x
-    Qs_ba, net_ba = _optimal_size_one_direction(pool_b, pool_a)
-    net_ba_usd = net_ba * price_bx if net_ba > float("-inf") else float("-inf")
-
-    if net_ab_usd <= 0 and net_ba_usd <= 0:
+    if net_ab_usd <= 0:
         return {
             "Q_star": 0.0, "net_star": 0.0, "net_star_usd": 0.0,
             "direction": "no_opportunity",
             "numeric_Q": 0.0, "error_pct": 0.0,
         }
 
-    if net_ab_usd >= net_ba_usd:
-        Q_star, net_star, net_star_usd = Qs_ab, net_ab, net_ab_usd
-        direction = "A→B"
-        pa, pb = pool_a, pool_b
-    else:
-        Q_star, net_star, net_star_usd = Qs_ba, net_ba, net_ba_usd
-        direction = "B→A"
-        pa, pb = pool_b, pool_a
+    Q_star, net_star, net_star_usd = Qs_ab, net_ab, net_ab_usd
+    pa, pb = pool_a, pool_b
 
     # 數值驗證
     bound = min(pa.x, pb.y) * 0.5
@@ -430,7 +419,7 @@ def optimal_size(
         "Q_star":       round(Q_star, 4),
         "net_star":     round(net_star, 6),
         "net_star_usd": round(net_star_usd, 6),
-        "direction":    direction,
+        "direction":    "A→B",
         "numeric_Q":    round(numeric_Q, 4),
         "error_pct":    round(error_pct, 4),
     }
@@ -1493,9 +1482,9 @@ class BorosYULeg:
             settle_fee = 0.0
 
         f_trade = CashFlow("USD", -trade_fee, t_hours=0.0, kind="fee")
-        f_trade.meta_key = "maker"
+        f_trade.meta_key = "both"   # Boros 費用 maker/taker 都要付
         f_settle = CashFlow("USD", -settle_fee, t_hours=horizon_hours / 2, kind="fee")
-        f_settle.meta_key = "maker"
+        f_settle.meta_key = "both"  # Boros 費用 maker/taker 都要付
 
         liq_cond = LiquidationCondition(
             driver="implied_apr",
@@ -1563,10 +1552,12 @@ def evaluate_strategy(legs: list, notional: float, horizon_hours: float,
         for r in results:
             for f in r.flows:
                 if f.kind == "fee":
-                    mk = getattr(f, "meta_key", "maker")
-                    if path == "maker" and mk != "taker":
+                    mk = getattr(f, "meta_key", "both")
+                    if mk == "both":
+                        total += f.amount          # 出現在 maker 和 taker 兩條路徑
+                    elif path == "maker" and mk == "maker":
                         total += f.amount
-                    elif path == "taker" and mk != "maker":
+                    elif path == "taker" and mk == "taker":
                         total += f.amount
         return total
 
@@ -1778,14 +1769,20 @@ def test_boros_four_leg():
 
         # ⑥ 費用 + 淨利明細
         print(f"  ℹ️  費用 maker = ${res['total_fee_maker']:,.0f}")
+        print(f"  ℹ️  費用 taker = ${res['total_fee_taker']:,.0f}")
         print(f"  ℹ️  淨利 maker = ${res['net_pnl_maker']:,.0f}  APR = {res['apr_maker']:.1%}")
         print(f"  ℹ️  淨利 taker = ${res['net_pnl_taker']:,.0f}  APR = {res['apr_taker']:.1%}")
 
-        # ⑦ 各腿費用
+        # ⑦ fee_taker <= fee_maker（費用是負值，|taker| >= |maker|）
+        ok = res["total_fee_taker"] <= res["total_fee_maker"]
+        print(f"  {'✅' if ok else '❌'} fee_taker({res['total_fee_taker']:,.0f}) <= fee_maker({res['total_fee_maker']:,.0f})  taker 費用應 ≥ maker")
+        if not ok: failures.append(f"fee_taker={res['total_fee_taker']:.0f} > fee_maker={res['total_fee_maker']:.0f}")
+
+        # ⑧ 各腿費用
         labels = ["PerpShort@HL", "PerpLong@OKX", "BorosShort@HL", "BorosLong@OKX"]
         for i, (r, lbl) in enumerate(zip(res["results"], labels)):
             fees = sum(f.amount for f in r.flows if f.kind == "fee"
-                       and getattr(f, "meta_key", "maker") != "taker")
+                       and getattr(f, "meta_key", "both") != "taker")
             print(f"    Leg{i+1} {lbl}: ${fees:,.0f}")
 
         if failures:
